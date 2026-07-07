@@ -32,3 +32,4 @@ tmp/
 
 # uTools / Electron 可能产生的临时文件
 *.asar
+node_modules
