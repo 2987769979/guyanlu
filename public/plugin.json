@@ -1,0 +1,41 @@
+{
+  "main": "index.html",
+  "logo": "logo.png",
+  "preload": "preload.js",
+  "pluginSetting": {
+    "single": true,
+    "height": 760
+  },
+  "features": [
+    {
+      "code": "stock-review",
+      "mainHide": true,
+      "explain": "A股量能复盘：市场看板、股票池、板块强弱、策略配置和回测分析",
+      "cmds": [
+        "股研录",
+        "量能复盘",
+        "A股复盘"
+      ]
+    },
+    {
+      "code": "stock-pool",
+      "mainHide": true,
+      "explain": "查看量能复盘股票池和次日重点跟踪池",
+      "cmds": [
+        "选股结果",
+        "股票池",
+        "候选股"
+      ]
+    },
+    {
+      "code": "risk-watch",
+      "mainHide": true,
+      "explain": "查看放量下跌、高换手、长上影和爆量滞涨等风险观察清单",
+      "cmds": [
+        "风险观察",
+        "风险股",
+        "复盘风险"
+      ]
+    }
+  ]
+}
