@@ -20,6 +20,7 @@ export const LEGACY_STORAGE_KEYS = {
 
 const MISSING = Symbol('missing')
 
+// 存储优先使用 uTools dbStorage；浏览器环境或异常时回退到 localStorage。
 function getDbStorage() {
   if (typeof window === 'undefined') return null
   return window.utools?.dbStorage || null
@@ -121,6 +122,7 @@ function removeLocalValue(key) {
   }
 }
 
+// 读取配置时兼容旧 key；命中 localStorage 或旧 key 后会写回新 key，完成轻量迁移。
 export function readStoredValue(key, fallback, legacyKeys = []) {
   const dbValue = readDbValue(key)
   if (hasStoredValue(dbValue)) return dbValue
@@ -142,6 +144,7 @@ export function readStoredValue(key, fallback, legacyKeys = []) {
   return fallback
 }
 
+// 写入时先尝试 uTools 存储，失败再落到浏览器 localStorage，保证普通开发环境也能跑。
 export function writeStoredValue(key, value) {
   if (writeDbValue(key, value)) return true
   return writeLocalValue(key, value)
@@ -154,6 +157,7 @@ export function removeStoredValue(key, legacyKeys = []) {
   })
 }
 
+// 缓存最新行情时只保留复盘需要的轻量字段，避免把原始行情全量塞进本地存储。
 function toStoredDataBundle(bundle) {
   const stocks = Array.isArray(bundle?.stocks) ? bundle.stocks : []
   return {
@@ -183,6 +187,7 @@ function isUsableDataBundle(value) {
   )
 }
 
+// 启动时恢复最近一次真实数据；格式不完整则返回空，让应用使用样例数据兜底。
 export function loadLatestDataBundle() {
   const snapshot = readStoredValue(STORAGE_KEYS.latestData, null)
   const bundle = snapshot?.bundle || snapshot

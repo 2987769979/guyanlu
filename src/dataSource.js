@@ -1,6 +1,7 @@
 import { marketSnapshot, sectorRows, stockUniverse } from './sampleData'
 import { LEGACY_STORAGE_KEYS, STORAGE_KEYS, readStoredValue, writeStoredValue } from './storage'
 
+// 数据源默认配置：页面会在此基础上合并用户保存过的设置。
 export const DEFAULT_DATA_CONFIG = {
   source: 'sample',
   provider: 'quantapi-http',
@@ -23,6 +24,7 @@ export const DEFAULT_DATA_CONFIG = {
 
 const ONE_DAY = 24 * 60 * 60 * 1000
 
+// 本地样例数据保持和真实数据相同的数据结构，方便 UI 与策略逻辑统一处理。
 export function createSampleDataBundle() {
   return {
     market: marketSnapshot,
@@ -97,6 +99,7 @@ export function parseStockMeta(text) {
   return map
 }
 
+// 把外部接口返回的逐日行情行转换成应用内部使用的 market/sectors/stocks 数据包。
 export function buildDataBundleFromIfindRows({ rows, config, fetchedAt }) {
   const grouped = groupRows(rows)
   const metaMap = parseStockMeta(config.stockMetaText)
@@ -214,6 +217,7 @@ function sourceLabelFor(source) {
   }[source] || '外部数据源'
 }
 
+// 兼容 iFinD、东方财富、AKShare 等不同表格形态，统一摊平成按日期排列的行数组。
 export function normalizeIfindPayload(payload) {
   const tables = Array.isArray(payload?.tables)
     ? payload.tables
@@ -254,6 +258,7 @@ function groupRows(rows) {
   return map
 }
 
+// 不同数据源字段名不一致，这里集中维护别名，避免转换逻辑里到处写条件判断。
 const FIELD_ALIASES = {
   name: ['name', 'stockName', 'stock_name', 'securityName', 'secName', 'ths_stock_short_name_stock'],
   open: ['open', 'openPrice', 'open_price', 'ths_open_price_stock'],
@@ -268,6 +273,7 @@ const FIELD_ALIASES = {
   highLike: ['high', 'highPrice', 'high_price', 'ths_high_price_stock', 'close', 'latest', 'ths_close_price_stock']
 }
 
+// 根据当前股票样本估算市场宽度、成交额和强弱状态。
 function buildMarketSnapshot(stocks, fetchedAt) {
   const advancers = stocks.filter(stock => stock.pctChg > 0).length
   const decliners = stocks.filter(stock => stock.pctChg < 0).length
@@ -298,6 +304,7 @@ function buildMarketSnapshot(stocks, fetchedAt) {
   }
 }
 
+// 按行业/概念聚合股票，计算板块涨跌、广度和热度分。
 function buildSectors(stocks) {
   const groups = new Map()
   stocks.forEach(stock => {
@@ -339,6 +346,7 @@ function buildSectors(stocks) {
   }).sort((a, b) => b.score - a.score)
 }
 
+// 将成交额转换成 0-1 分位，后续策略用它衡量资金关注度。
 function applyAmountRank(stocks) {
   const sorted = [...stocks].sort((a, b) => a.amount - b.amount)
   const rankMap = new Map(sorted.map((stock, index) => [stock.code, sorted.length <= 1 ? 1 : index / (sorted.length - 1)]))

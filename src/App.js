@@ -4,7 +4,6 @@ import {
   Alert,
   Box,
   Button,
-  Checkbox,
   Chip,
   CssBaseline,
   Dialog,
@@ -139,10 +138,10 @@ const POOL_ORDER = [TOP_RANKED_POOL_ID, 'focus', 'broad', 'strongVolume', 'mildT
 
 const DATA_SOURCE_STATUS = {
   sample: '当前使用本地样例数据',
-  quantapi: '同花顺数据源待配置',
+  // quantapi: '同花顺数据源待配置',
   eastmoney: '东方财富数据源待更新',
   free: '免费稳定模式待更新',
-  akshare: 'AKShare 数据源待更新'
+  // akshare: 'AKShare 数据源待更新'
 }
 
 const DATA_SOURCE_LABEL = {
@@ -158,6 +157,7 @@ const ALL_MARKET_REFRESH_TIMEOUT_MS = 45000
 const ALL_MARKET_HISTORY_ENHANCE_LIMIT = 120
 const ALL_MARKET_HISTORY_ENHANCE_TIMEOUT_MS = 90000
 const FULL_HISTORY_DEFAULT_DELAY_MS = 1500
+const FULL_HISTORY_DEFAULT_CONCURRENCY = 5
 const HISTORY_SYNC_ACTIVE_STATUSES = new Set(['preparing', 'running', 'stopping'])
 const EMPTY_HISTORY_SYNC_STATE = {
   status: 'idle',
@@ -167,12 +167,15 @@ const EMPTY_HISTORY_SYNC_STATE = {
   failed: 0,
   pending: 0,
   progress: 0,
+  concurrency: FULL_HISTORY_DEFAULT_CONCURRENCY,
+  failedTaskCount: 0,
   stockListFile: '',
   dateIndexFile: '',
   dailyDir: '',
   dailyFiles: [],
   dates: [],
   items: [],
+  failedTasks: [],
   errors: []
 }
 const PORTFOLIO_QUOTE_REFRESH_MS = 15000
@@ -208,6 +211,7 @@ function errorDetail(error, context = '') {
   return parts.filter(Boolean).join('\n\n')
 }
 
+// 加载用户保存过的策略参数，并和默认策略合并，防止版本升级后缺少新增字段。
 function loadStrategy() {
   try {
     const saved = readStoredValue(STORAGE_KEYS.strategy, null, [LEGACY_STORAGE_KEYS.strategy])
@@ -257,6 +261,7 @@ function loadInitialDataBundle(dataConfig) {
   return loadLatestDataBundle() || createSampleDataBundle()
 }
 
+// 应用启动时同时准备数据源配置和首屏数据，保证后续状态初始化来自同一份配置。
 function createInitialAppState() {
   const dataConfig = loadInitialDataConfig()
   return {
@@ -265,6 +270,7 @@ function createInitialAppState() {
   }
 }
 
+// 实时行情会覆盖同一股票同一日期的历史行，让页面优先展示最新价格。
 function mergeLatestRows(historyRows, realtimeRows) {
   if (!realtimeRows.length) return historyRows
   const map = new Map()
@@ -312,6 +318,7 @@ function isShareLot(value, { max = Infinity, allowClearRemainder = false } = {})
   return shares >= SHARE_LOT_SIZE && shares % SHARE_LOT_SIZE === 0
 }
 
+// 将行情接口返回值转换成持仓模块可直接按代码索引的报价表。
 function buildPortfolioQuoteMap(payload, fetchedAt, endpoint) {
   const rows = normalizeIfindPayload(payload)
   const map = {}
@@ -408,6 +415,7 @@ function canRunReturnBacktest(dataBundle) {
   return dataBundle.supportsBacktest === true
 }
 
+// 全市场扫描先拿快照，再给排名靠前的股票补历史K线，提升评分和图表的可信度。
 async function enhanceAllMarketHistory({ bridge, config, snapshotBundle, snapshotRows, sourceName, strategy, setStatus }) {
   if (!bridge?.fetchEastmoneyHistory) return snapshotBundle
 
@@ -475,6 +483,7 @@ async function enhanceAllMarketHistory({ bridge, config, snapshotBundle, snapsho
   }
 }
 
+// 全市场模式下后端没有稳定板块表时，直接从已评分股票反推展示用板块列表。
 function buildDisplaySectorsFromStocks(stocks) {
   const groups = new Map()
   stocks.forEach(stock => {
@@ -512,6 +521,7 @@ function buildDisplaySectorsFromStocks(stocks) {
   }).sort((a, b) => b.score - a.score)
 }
 
+// uTools 主入口只负责拉起独立窗口；真正的桌面界面通过 window=desktop 运行。
 function isLauncherWindow() {
   if (typeof window === 'undefined' || !window.utools) return false
   try {
@@ -525,9 +535,71 @@ function isLauncherWindow() {
   }
 }
 
-export default function App() {
-  if (isLauncherWindow()) return null
+// 启动壳页面：自动打开独立窗口，失败时给用户一个手动重试按钮。
+function LauncherWindow() {
+  const [status, setStatus] = useState('正在打开股研录窗口...')
+  const [error, setError] = useState('')
 
+  async function openWindow(forceReload = false) {
+    const bridge = window.stockReviewBridge
+    if (!bridge?.openDesktopWindow) {
+      setError('当前环境不支持打开独立窗口，请在 uTools 中运行')
+      return
+    }
+
+    try {
+      setError('')
+      setStatus(forceReload ? '正在重新打开股研录窗口...' : '正在打开股研录窗口...')
+      const result = await bridge.openDesktopWindow({ forceReload, verify: true })
+      if (!result?.ok) {
+        setError('独立窗口打开失败，请点击按钮重试')
+        return
+      }
+      setStatus('股研录窗口已打开')
+    } catch (err) {
+      setError(err?.message || '独立窗口打开失败，请点击按钮重试')
+    }
+  }
+
+  useEffect(() => {
+    const timer = setTimeout(() => openWindow(false), 80)
+    return () => clearTimeout(timer)
+  }, [])
+
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <Box
+        sx={{
+          minHeight: '100vh',
+          display: 'grid',
+          placeItems: 'center',
+          bgcolor: 'background.default',
+          p: 2
+        }}
+      >
+        <Paper variant='outlined' sx={{ width: 'min(420px, 100%)', p: 3 }}>
+          <Stack spacing={2} alignItems='flex-start'>
+            <Stack direction='row' spacing={1.2} alignItems='center'>
+              <BarChartIcon color='primary' />
+              <Typography variant='h6' fontWeight={800}>股研录</Typography>
+            </Stack>
+            <Typography variant='body2' color='text.secondary'>{status}</Typography>
+            {error && <Alert severity='warning' sx={{ width: '100%' }}>{error}</Alert>}
+            <Button variant='contained' startIcon={<RestartAltIcon />} onClick={() => openWindow(true)}>
+              重新打开窗口
+            </Button>
+          </Stack>
+        </Paper>
+      </Box>
+    </ThemeProvider>
+  )
+}
+
+export default function App() {
+  if (isLauncherWindow()) return <LauncherWindow />
+
+  // 主应用状态分为四块：数据源/策略、页面筛选、持仓交易、后台历史同步。
   const compact = useMediaQuery('(max-width: 900px)')
   const [initialAppState] = useState(createInitialAppState)
   const [activePage, setActivePage] = useState('review')
@@ -536,10 +608,12 @@ export default function App() {
   const [dataBundle, setDataBundle] = useState(initialAppState.dataBundle)
   const [historySync, setHistorySync] = useState(EMPTY_HISTORY_SYNC_STATE)
   const [historySyncBusy, setHistorySyncBusy] = useState(false)
+  const [historySyncAction, setHistorySyncAction] = useState(null)
   const [historySyncForm, setHistorySyncForm] = useState(() => ({
     startDate: initialAppState.dataConfig.startDate,
     endDate: initialAppState.dataConfig.endDate,
     delayMs: FULL_HISTORY_DEFAULT_DELAY_MS,
+    concurrency: FULL_HISTORY_DEFAULT_CONCURRENCY,
     adjust: initialAppState.dataConfig.eastmoneyAdjust || '1'
   }))
   const [selectedPool, setSelectedPool] = useState(TOP_RANKED_POOL_ID)
@@ -572,6 +646,7 @@ export default function App() {
   const activeSectors = dataBundle.sectors
   const activeStocks = dataBundle.stocks
 
+  // 所有页面共享同一批评分结果，避免每个页面重复跑策略引擎。
   const scoredStocks = useMemo(() => {
     const scored = enrichStocks(activeStocks, activeSectors, activeMarket, strategy)
     return scored
@@ -619,10 +694,12 @@ export default function App() {
     return Array.from(new Set(portfolio.map(item => normalizePortfolioCode(item.code)).filter(Boolean))).join(',')
   }, [portfolio])
 
+  // 用户配置与本地笔记即时持久化，刷新或重新打开窗口后能恢复工作现场。
   useEffect(() => {
     saveDataConfig(dataConfig)
   }, [dataConfig])
 
+  // 持仓页打开后定时拉取快照报价，只在数据变化时刷新状态，减少无意义重渲染。
   useEffect(() => {
     writeStoredValue(STORAGE_KEYS.reviewNotes, notes)
   }, [notes])
@@ -761,29 +838,19 @@ export default function App() {
   }, [dataConfig])
 
   useEffect(() => {
-    if (activePage !== 'historySync') return undefined
-    if (historySync.items?.length) {
-      refreshFullHistoryStatus({ silent: true })
-      return undefined
-    }
-    handlePrepareFullHistoryList(false)
-    return undefined
-  }, [activePage])
-
-  useEffect(() => {
-    if (activePage !== 'historySync' && !historySyncActive) return undefined
+    if (!historySyncActive) return undefined
     let cancelled = false
     const poll = async () => {
       const snapshot = await refreshFullHistoryStatus({ silent: true })
       if (!cancelled && snapshot) setHistorySync(snapshot)
     }
     poll()
-    const timer = setInterval(poll, historySyncActive ? 2000 : 5000)
+    const timer = setInterval(poll, 2000)
     return () => {
       cancelled = true
       clearInterval(timer)
     }
-  }, [activePage, historySyncActive])
+  }, [historySyncActive])
 
   async function refreshFullHistoryStatus(options = {}) {
     const bridge = window.stockReviewBridge
@@ -831,21 +898,76 @@ export default function App() {
     }
     try {
       setHistorySyncBusy(true)
+      setHistorySyncAction({
+        type: 'snapshot',
+        label: '正在刷新快照清单',
+        detail: '正在优先使用 Baostock 重建本地股票清单；失败后切换东方财富。',
+        startedAt: Date.now()
+      })
+      setHistorySync(current => ({
+        ...current,
+        message: '正在刷新快照清单...'
+      }))
+      setStatus(
+        '正在刷新快照清单...',
+        '正在优先使用 Baostock 获取清单，失败后切换东方财富 clist'
+      )
       const snapshot = await bridge.refreshFullMarketStockListFromSnapshot()
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
-      const actionText = snapshot?.stockListUpdated ? '已重新生成' : '数量一致，保留现有'
+      const actionText = snapshot?.stockListUpdated ? '已重新生成' : '未生成'
+      const message = snapshot?.message || `${actionText}全市场股票清单：${snapshot?.snapshotStockCount || snapshot?.total || 0} 只`
       setStatus(
-        `${actionText}全市场股票清单：${snapshot?.snapshotStockCount || snapshot?.total || 0} 只`,
-        snapshot?.stockListFile || ''
+        message,
+        snapshot?.stockListFile || snapshot?.error || ''
       )
     } catch (error) {
       setStatus(error.message || '刷新全市场股票清单失败', errorDetail(error, '刷新全市场股票清单失败'))
     } finally {
       setHistorySyncBusy(false)
+      setHistorySyncAction(null)
     }
   }
 
-  async function handleStartFullHistorySync(selectedCodes = []) {
+  async function handleInstallBaostockPackage() {
+    const bridge = window.stockReviewBridge
+    if (!bridge?.installBaostockPackage) {
+      setStatus('当前环境不支持安装 Baostock，请在 uTools/Electron 中运行')
+      return
+    }
+    const pythonPath = String(dataConfig.pythonPath || '').trim()
+    try {
+      setHistorySyncBusy(true)
+      setHistorySyncAction({
+        type: 'installBaostock',
+        label: '正在安装 Baostock',
+        detail: `正在执行 ${pythonPath || 'python'} -m pip install baostock`,
+        startedAt: Date.now()
+      })
+      setHistorySync(current => ({
+        ...current,
+        message: '正在安装 Baostock...'
+      }))
+      setStatus('正在安装 Baostock...', `正在执行 ${pythonPath || 'python'} -m pip install baostock`)
+      const result = await bridge.installBaostockPackage({ pythonPath })
+      const output = [result?.stdout, result?.stderr].filter(Boolean).join('\n').trim()
+      setStatus('Baostock 安装完成', output || result?.command || 'pip install baostock')
+      setHistorySync(current => ({
+        ...current,
+        message: 'Baostock 安装完成'
+      }))
+    } catch (error) {
+      setStatus(error.message || 'Baostock 安装失败', errorDetail(error, 'Baostock 安装失败'))
+      setHistorySync(current => ({
+        ...current,
+        message: error.message || 'Baostock 安装失败'
+      }))
+    } finally {
+      setHistorySyncBusy(false)
+      setHistorySyncAction(null)
+    }
+  }
+
+  async function handleStartFullHistorySync() {
     const bridge = window.stockReviewBridge
     if (!bridge?.startFullMarketHistorySync) {
       setStatus('当前环境不支持全市场历史数据同步，请在 uTools/Electron 中运行')
@@ -855,13 +977,35 @@ export default function App() {
       setHistorySyncBusy(true)
       const snapshot = await bridge.startFullMarketHistorySync({
         ...historySyncForm,
-        codes: Array.isArray(selectedCodes) && selectedCodes.length ? selectedCodes.join(',') : '',
-        delayMs: Number(historySyncForm.delayMs) || FULL_HISTORY_DEFAULT_DELAY_MS
+        delayMs: Number(historySyncForm.delayMs) || FULL_HISTORY_DEFAULT_DELAY_MS,
+        concurrency: Number(historySyncForm.concurrency) || FULL_HISTORY_DEFAULT_CONCURRENCY
       })
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
       setStatus(snapshot?.message || '全市场历史数据同步已开始', snapshot?.dateIndexFile || snapshot?.outputFile || '')
     } catch (error) {
       setStatus(error.message || '启动全市场历史数据同步失败', errorDetail(error, '启动全市场历史数据同步失败'))
+    } finally {
+      setHistorySyncBusy(false)
+    }
+  }
+
+  async function handleRetryFailedHistoryTasks() {
+    const bridge = window.stockReviewBridge
+    if (!bridge?.retryFullMarketFailedTasks) {
+      setStatus('当前环境不支持补跑失败任务，请在 uTools/Electron 中运行')
+      return
+    }
+    try {
+      setHistorySyncBusy(true)
+      const snapshot = await bridge.retryFullMarketFailedTasks({
+        ...historySyncForm,
+        delayMs: Number(historySyncForm.delayMs) || FULL_HISTORY_DEFAULT_DELAY_MS,
+        concurrency: Number(historySyncForm.concurrency) || FULL_HISTORY_DEFAULT_CONCURRENCY
+      })
+      setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
+      setStatus(snapshot?.message || '已开始补跑失败任务', snapshot?.dateIndexFile || snapshot?.outputFile || '')
+    } catch (error) {
+      setStatus(error.message || '补跑失败任务启动失败', errorDetail(error, '补跑失败任务启动失败'))
     } finally {
       setHistorySyncBusy(false)
     }
@@ -879,6 +1023,7 @@ export default function App() {
     }
   }
 
+  // 根据当前数据源配置调度不同桥接接口，并统一转换成应用内部数据包。
   const handleRefreshData = async (nextConfig = dataConfig, options = {}) => {
     if (nextConfig.source === 'sample') {
       clearLatestDataBundle()
@@ -1081,6 +1226,7 @@ export default function App() {
     }
   }
 
+  // 只拉少量样本验证数据源可用性，避免用户调配置时触发全量刷新。
   const handleTestConnection = async () => {
     const bridge = window.stockReviewBridge
     if (!bridge) {
@@ -1257,6 +1403,7 @@ export default function App() {
     })
   }
 
+  // 卖出/减仓会同时更新当前持仓和交易流水，历史盈亏从流水里汇总。
   const handleSellPosition = ({ position, sellShares, sellPrice }) => {
     const shares = Number(sellShares) || 0
     const price = Number(sellPrice) || 0
@@ -1295,7 +1442,7 @@ export default function App() {
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
-      <Box className={compact ? 'app app-compact' : 'app'}>
+      <Box data-stock-review-app='desktop' className={compact ? 'app app-compact' : 'app'}>
         <Paper className='sidebar' elevation={0}>
           <Box className='brand'>
             <BarChartIcon color='primary' />
@@ -1444,9 +1591,12 @@ export default function App() {
               onFormChange={setHistorySyncForm}
               isBusy={historySyncBusy}
               isActive={historySyncActive}
+              action={historySyncAction}
               onPrepareList={() => handlePrepareFullHistoryList(true)}
               onRefreshStockList={handleRefreshFullMarketStockSnapshot}
+              onInstallBaostock={handleInstallBaostockPackage}
               onStart={handleStartFullHistorySync}
+              onRetryFailed={handleRetryFailedHistoryTasks}
               onStop={handleStopFullHistorySync}
               onRefresh={() => refreshFullHistoryStatus()}
             />
@@ -1844,6 +1994,19 @@ function StockPage({ stock, stocks, note, watchlist, onSelectStock, onNoteChange
 }
 
 function SectorsPage({ sectors, scoredStocks, onOpenPool }) {
+  const rows = Array.isArray(sectors) ? sectors : []
+  const [page, setPage] = useState(0)
+  const [rowsPerPage, setRowsPerPage] = useState(20)
+  const pageRows = useMemo(() => {
+    const start = page * rowsPerPage
+    return rows.slice(start, start + rowsPerPage)
+  }, [rows, page, rowsPerPage])
+
+  useEffect(() => {
+    const maxPage = Math.max(0, Math.ceil(rows.length / rowsPerPage) - 1)
+    if (page > maxPage) setPage(maxPage)
+  }, [rows.length, rowsPerPage, page])
+
   return (
     <Box className='page'>
       <PageTitle icon={<StackedBarChartIcon color='primary' />} title='板块强弱页' />
@@ -1864,7 +2027,7 @@ function SectorsPage({ sectors, scoredStocks, onOpenPool }) {
               </TableRow>
             </TableHead>
             <TableBody>
-              {sectors.map(sector => {
+              {pageRows.map(sector => {
                 const count = scoredStocks.filter(stock => stock.sectorKey === sector.key).length
                 return (
                   <TableRow key={sector.key} hover>
@@ -1894,7 +2057,7 @@ function SectorsPage({ sectors, scoredStocks, onOpenPool }) {
         </TableContainer>
         <TablePagination
           component='div'
-          count={filteredRows.length}
+          count={rows.length}
           page={page}
           rowsPerPage={rowsPerPage}
           rowsPerPageOptions={[10, 20, 50, 100]}
@@ -2188,15 +2351,19 @@ function StrategyPage({
   )
 }
 
+// 历史同步页负责展示后台全市场K线任务，包括准备清单、启动、停止和失败补跑。
 function HistorySyncPage({
   state,
   form,
   onFormChange,
   isBusy,
   isActive,
+  action,
   onPrepareList,
   onRefreshStockList,
+  onInstallBaostock,
   onStart,
+  onRetryFailed,
   onStop,
   onRefresh
 }) {
@@ -2208,7 +2375,10 @@ function HistorySyncPage({
   const [statusFilter, setStatusFilter] = useState('all')
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(20)
-  const [selectedCodes, setSelectedCodes] = useState(() => new Set())
+  const [actionClock, setActionClock] = useState(Date.now())
+  const actionElapsedMs = action?.startedAt ? Math.max(0, actionClock - action.startedAt) : 0
+  const isSnapshotRefreshing = action?.type === 'snapshot'
+  const isBaostockInstalling = action?.type === 'installBaostock'
 
   const filteredRows = useMemo(() => {
     const keyword = query.trim().toLowerCase()
@@ -2222,23 +2392,17 @@ function HistorySyncPage({
     const start = page * rowsPerPage
     return filteredRows.slice(start, start + rowsPerPage)
   }, [filteredRows, page, rowsPerPage])
-  const selectedCount = selectedCodes.size
-  const currentPageSelectedCount = pageRows.filter(row => selectedCodes.has(row.code)).length
-  const allCurrentPageSelected = pageRows.length > 0 && currentPageSelectedCount === pageRows.length
-  const currentPageIndeterminate = currentPageSelectedCount > 0 && currentPageSelectedCount < pageRows.length
-
-  useEffect(() => {
-    setSelectedCodes(current => {
-      const validCodes = new Set(rows.map(row => row.code))
-      const next = new Set(Array.from(current).filter(code => validCodes.has(code)))
-      return next.size === current.size ? current : next
-    })
-  }, [rows])
-
   useEffect(() => {
     const maxPage = Math.max(0, Math.ceil(filteredRows.length / rowsPerPage) - 1)
     if (page > maxPage) setPage(maxPage)
   }, [filteredRows.length, rowsPerPage, page])
+
+  useEffect(() => {
+    if (!action) return undefined
+    setActionClock(Date.now())
+    const timer = setInterval(() => setActionClock(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [action])
 
   const handleQueryChange = event => {
     setQuery(event.target.value)
@@ -2247,36 +2411,6 @@ function HistorySyncPage({
   const handleStatusFilterChange = event => {
     setStatusFilter(event.target.value)
     setPage(0)
-  }
-  const toggleRowSelected = code => {
-    setSelectedCodes(current => {
-      const next = new Set(current)
-      if (next.has(code)) next.delete(code)
-      else next.add(code)
-      return next
-    })
-  }
-  const selectCurrentPage = () => {
-    setSelectedCodes(current => {
-      const next = new Set(current)
-      pageRows.forEach(row => next.add(row.code))
-      return next
-    })
-  }
-  const invertCurrentPage = () => {
-    setSelectedCodes(current => {
-      const next = new Set(current)
-      pageRows.forEach(row => {
-        if (next.has(row.code)) next.delete(row.code)
-        else next.add(row.code)
-      })
-      return next
-    })
-  }
-  const clearSelected = () => setSelectedCodes(new Set())
-  const startSelected = () => {
-    if (!selectedCodes.size) return
-    onStart(Array.from(selectedCodes))
   }
 
   return (
@@ -2289,14 +2423,27 @@ function HistorySyncPage({
             <Button startIcon={<SyncIcon />} variant='outlined' onClick={onPrepareList} disabled={isBusy || isActive}>
               刷新列表
             </Button>
-            <Button startIcon={<TableChartIcon />} variant='outlined' onClick={onRefreshStockList} disabled={isBusy || isActive}>
-              刷新快照清单
+            <Button
+              startIcon={isSnapshotRefreshing ? <SyncIcon className='spin-icon' /> : <TableChartIcon />}
+              variant='outlined'
+              onClick={onRefreshStockList}
+              disabled={isBusy || isActive}
+            >
+              {isSnapshotRefreshing ? `刷新中 ${formatElapsed(actionElapsedMs)}` : '刷新快照清单'}
+            </Button>
+            <Button
+              startIcon={isBaostockInstalling ? <SyncIcon className='spin-icon' /> : <AddCircleOutlineIcon />}
+              variant='outlined'
+              onClick={onInstallBaostock}
+              disabled={isBusy || isActive}
+            >
+              {isBaostockInstalling ? `安装中 ${formatElapsed(actionElapsedMs)}` : '安装 Baostock'}
             </Button>
             <Button startIcon={<PlayArrowIcon />} variant='contained' onClick={() => onStart()} disabled={isBusy || isActive}>
               开始获取
             </Button>
-            <Button startIcon={<PlayArrowIcon />} color='secondary' variant='contained' onClick={startSelected} disabled={isBusy || isActive || !selectedCount}>
-              获取选中{selectedCount ? `(${selectedCount})` : ''}
+            <Button startIcon={<RestartAltIcon />} color='warning' variant='outlined' onClick={onRetryFailed} disabled={isBusy || isActive || !state.failedTaskCount}>
+              重跑失败{state.failedTaskCount ? `(${state.failedTaskCount})` : ''}
             </Button>
             <Button startIcon={<RestartAltIcon />} color='warning' variant='outlined' onClick={onStop} disabled={!isActive}>
               停止
@@ -2337,6 +2484,15 @@ function HistorySyncPage({
             inputProps={{ min: 500, max: 60000, step: 100 }}
             disabled={isActive}
           />
+          <TextField
+            size='small'
+            type='number'
+            label='请求并发'
+            value={form.concurrency || FULL_HISTORY_DEFAULT_CONCURRENCY}
+            onChange={event => setFormValue('concurrency', Number(event.target.value))}
+            inputProps={{ min: 3, max: 10, step: 1 }}
+            disabled={isActive}
+          />
           <FormControl size='small'>
             <InputLabel>复权</InputLabel>
             <Select
@@ -2352,6 +2508,18 @@ function HistorySyncPage({
           </FormControl>
         </Box>
         <Stack spacing={1.1} mt={2}>
+          {action && (
+            <Alert severity='info' icon={<SyncIcon className='spin-icon' />}>
+              <Typography variant='body2' fontWeight={800}>
+                {action.label} · 已耗时 {formatElapsed(actionElapsedMs)}
+              </Typography>
+              {action.detail && (
+                <Typography variant='caption' color='text.secondary'>
+                  {action.detail}
+                </Typography>
+              )}
+            </Alert>
+          )}
           <Box className='panel-head'>
             <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap>
               <Chip size='small' label={statusMeta.label} color={statusMeta.color} variant='outlined' />
@@ -2392,6 +2560,7 @@ function HistorySyncPage({
         <MetricCard label='股票总数' value={state.total || rows.length} sub='全市场列表' accent='blue' />
         <MetricCard label='已获取' value={state.fetched || 0} sub='写入本地文件' accent='green' />
         <MetricCard label='未获取' value={state.pending || 0} sub='等待队列' accent='cyan' />
+        <MetricCard label='无数据' value={state.skipped || 0} sub='停牌/未上市，不补跑' accent='cyan' />
         <MetricCard label='失败' value={state.failed || 0} sub='可稍后重跑' accent='amber' />
       </Box>
 
@@ -2400,7 +2569,6 @@ function HistorySyncPage({
           <Typography variant='subtitle2' fontWeight={800}>获取历史数据的列表</Typography>
           <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap>
             <Chip size='small' label={`${filteredRows.length}/${rows.length} 只`} variant='outlined' />
-            <Chip size='small' color={selectedCount ? 'primary' : 'default'} label={`已选 ${selectedCount}`} variant='outlined' />
           </Stack>
         </Box>
         <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap mb={1.5}>
@@ -2424,32 +2592,15 @@ function HistorySyncPage({
               <MenuItem value='pending'>未获取</MenuItem>
               <MenuItem value='running'>获取中</MenuItem>
               <MenuItem value='done'>已获取</MenuItem>
+              <MenuItem value='skipped'>无数据</MenuItem>
               <MenuItem value='failed'>失败</MenuItem>
             </Select>
           </FormControl>
-          <Button size='small' variant='outlined' onClick={selectCurrentPage} disabled={!pageRows.length || isActive}>
-            当前页全选
-          </Button>
-          <Button size='small' variant='outlined' onClick={invertCurrentPage} disabled={!pageRows.length || isActive}>
-            当前页反选
-          </Button>
-          <Button size='small' variant='text' onClick={clearSelected} disabled={!selectedCount || isActive}>
-            清空选择
-          </Button>
         </Stack>
         <TableContainer className='table-wrap full-history-table'>
           <Table size='small' stickyHeader>
             <TableHead>
               <TableRow>
-                <TableCell padding='checkbox'>
-                  <Checkbox
-                    size='small'
-                    checked={allCurrentPageSelected}
-                    indeterminate={currentPageIndeterminate}
-                    onChange={() => (allCurrentPageSelected ? invertCurrentPage() : selectCurrentPage())}
-                    disabled={!pageRows.length || isActive}
-                  />
-                </TableCell>
                 <TableCell>股票代码</TableCell>
                 <TableCell>股票名称</TableCell>
                 <TableCell>获取状态</TableCell>
@@ -2460,15 +2611,7 @@ function HistorySyncPage({
             </TableHead>
             <TableBody>
               {pageRows.map(row => (
-                <TableRow key={row.code} hover selected={row.status === 'running' || selectedCodes.has(row.code)}>
-                  <TableCell padding='checkbox'>
-                    <Checkbox
-                      size='small'
-                      checked={selectedCodes.has(row.code)}
-                      onChange={() => toggleRowSelected(row.code)}
-                      disabled={isActive}
-                    />
-                  </TableCell>
+                <TableRow key={row.code} hover selected={row.status === 'running'}>
                   <TableCell><code>{row.code}</code></TableCell>
                   <TableCell>{row.name || row.code}</TableCell>
                   <TableCell><HistoryItemStatusChip status={row.status} /></TableCell>
@@ -2483,7 +2626,7 @@ function HistorySyncPage({
               ))}
               {!pageRows.length && (
                 <TableRow>
-                  <TableCell colSpan={7}>
+                  <TableCell colSpan={6}>
                     <Typography variant='body2' color='text.secondary' textAlign='center' py={3}>
                       {rows.length ? '没有符合条件的股票' : '暂无股票列表'}
                     </Typography>
@@ -2516,6 +2659,7 @@ function HistoryItemStatusChip({ status }) {
     pending: { label: '未获取', color: 'default' },
     running: { label: '获取中', color: 'warning' },
     done: { label: '已获取', color: 'success' },
+    skipped: { label: '无数据', color: 'info' },
     failed: { label: '失败', color: 'error' }
   }[status] || { label: status || '未获取', color: 'default' }
 
@@ -2788,6 +2932,13 @@ function formatDateTime(value) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+function formatElapsed(ms) {
+  const totalSeconds = Math.max(0, Math.floor((Number(ms) || 0) / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return minutes ? `${minutes}分${String(seconds).padStart(2, '0')}秒` : `${seconds}秒`
+}
+
 function signed(value, formatter = formatCny) {
   if (!Number.isFinite(value)) return '--'
   return `${value >= 0 ? '+' : ''}${formatter(value)}`
@@ -2806,6 +2957,7 @@ function createTransactionId() {
   return `txn-${Date.now()}-${Math.floor(Math.random() * 1e6)}`
 }
 
+// 将手工持仓、选股数据和实时快照合并成用于收益计算的一行持仓。
 function resolvePosition(position, stocks, portfolioQuotes = {}) {
   const normalizedCode = normalizePortfolioCode(position.code)
   const stock = stocks.find(item => normalizePortfolioCode(item.code) === normalizedCode)

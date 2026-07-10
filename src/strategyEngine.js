@@ -1,3 +1,4 @@
+// 默认策略参数：权重决定各评分因子的占比，阈值决定候选池筛选边界。
 export const DEFAULT_STRATEGY = {
   id: 'volume-review-v1.1',
   name: '量能复盘 V1.1',
@@ -44,6 +45,7 @@ const round = (value, digits = 1) => {
 
 const percentRankScore = value => clamp((Number(value) || 0) * 100)
 
+// 对“过低不好、适中最好、过高也扣分”的指标做区间评分，比如换手率。
 function scoreRangePeak(value, low, idealLow, idealHigh, high) {
   if (value <= low || value >= high) return value < low ? clamp((value / low) * 45) : 35
   if (value >= idealLow && value <= idealHigh) return 92
@@ -112,6 +114,7 @@ function upperBound(values, target) {
   return left
 }
 
+// 计算个股相对市场的强弱分位，用来衡量它是否跑赢整体样本。
 function buildRelativeStrengthScoreMap(universe) {
   const values = universe
     .map(item => (item.stockReturn20 || 0) - (item.marketReturn20 || 0))
@@ -137,6 +140,7 @@ function calcSectorScore(sector) {
   )
 }
 
+// 汇总技术形态里的风险信号，并把它们转换成总分里的扣分项。
 function calcRisk(stock) {
   const riskTags = []
   let penalty = 0
@@ -221,6 +225,7 @@ function calcMarketAdjustment(market) {
   return 0
 }
 
+// 给原始股票列表补齐策略评分、风险标签、入选原因和排名，是页面展示的核心数据源。
 export function enrichStocks(universe, sectors, market, strategy = DEFAULT_STRATEGY) {
   const sectorMap = new Map(sectors.map(sector => [sector.key, sector]))
   const relativeStrengthScores = buildRelativeStrengthScoreMap(universe)
@@ -268,6 +273,7 @@ export function enrichStocks(universe, sectors, market, strategy = DEFAULT_STRAT
     .map((stock, index) => ({ ...stock, rank: index + 1 }))
 }
 
+// 按策略规则把已评分股票拆成不同候选池，供“重点跟踪、放量、突破、风险”等页面复用。
 export function buildPools(scoredStocks, strategy = DEFAULT_STRATEGY, market = { marketScore: 0 }, options = {}) {
   if (shouldUseSnapshotPools(scoredStocks, options)) {
     return buildSnapshotPools(scoredStocks, strategy)
@@ -323,6 +329,7 @@ function shouldUseSnapshotPools(scoredStocks, options = {}) {
   return stocksWithHistory / scoredStocks.length < 0.35
 }
 
+// 全市场快照缺少完整历史K线时，放宽部分历史依赖条件，先给出可浏览的候选结果。
 function buildSnapshotPools(scoredStocks, strategy = DEFAULT_STRATEGY) {
   const t = strategy.thresholds
   const broad = scoredStocks
@@ -388,6 +395,7 @@ function buildSnapshotPools(scoredStocks, strategy = DEFAULT_STRATEGY) {
   return { focus, broad, strongVolume, mildTurnover, breakout, risk }
 }
 
+// 把市场、板块、股票池和风险信息整理成复盘摘要文案。
 export function buildReview(scoredStocks, pools, market, sectors) {
   const topSector = [...sectors].sort((a, b) => b.score - a.score)[0]
   const avgScore = scoredStocks.reduce((sum, item) => sum + item.totalScore, 0) / scoredStocks.length
@@ -402,6 +410,7 @@ export function buildReview(scoredStocks, pools, market, sectors) {
   }
 }
 
+// 基于样例数据里的未来收益字段做轻量回测，用于验证策略参数变化的方向感。
 export function runBacktestFromSample(scoredStocks, strategy = DEFAULT_STRATEGY) {
   const candidates = scoredStocks.filter(stock => stock.selected || stock.totalScore >= strategy.thresholds.minScore)
   const tradable = candidates.filter(stock => stock.nextOpenRet < 5.5)

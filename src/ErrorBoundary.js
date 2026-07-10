@@ -5,6 +5,7 @@ import Button from '@mui/material/Button'
 
 const GLOBAL_ERROR_ID = `global-error-${Date.now()}`
 
+// 为相同错误生成稳定 ID，用来把重复报错合并成计数，而不是刷满页面。
 function hashString(str) {
   let hash = 0
   for (let i = 0; i < str.length; i++) {
@@ -14,10 +15,12 @@ function hashString(str) {
   return `error-${hash >>> 0}`
 }
 
+// 本地 file URL 太长，展示前压缩成文件名和行列号，方便在弹窗里阅读。
 function compactStack(stack) {
   return (stack || '').replace(/file:\/\/\/.*?([^/\\]+:\d+:\d+)/g, '$1')
 }
 
+// 捕获 React 边界之外的运行时错误，并在页面右侧追加可复制的错误卡片。
 function showGlobalError(err, type) {
   if (!err?.name || !err?.message) return
   const errorId = hashString(`${err.name}:${err.message}`)
@@ -86,6 +89,7 @@ function showGlobalError(err, type) {
   containerEl.appendChild(cardEl)
 }
 
+// React 渲染兜底：组件树崩溃时展示错误详情，避免整页白屏。
 export default class ErrorBoundary extends React.Component {
   state = { error: null }
 

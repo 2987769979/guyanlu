@@ -14,19 +14,73 @@ const path = require('path')
 const IFIND_API_BASE = 'https://quantapi.51ifind.com/api/v1'
 const EASTMONEY_UT = '7eea3edcaed734bea9cbfc24409ed989'
 const EASTMONEY_SPOT_FIELDS = 'f12,f14,f2,f3,f5,f6,f8,f15,f16,f17,f18'
-const EASTMONEY_ULIST_ENDPOINT = 'http://push2.eastmoney.com/api/qt/ulist.np/get'
+const EASTMONEY_ULIST_ENDPOINTS = [
+  'https://push2.eastmoney.com/api/qt/ulist.np/get',
+  'http://push2.eastmoney.com/api/qt/ulist.np/get'
+]
+const EASTMONEY_ULIST_ENDPOINT = EASTMONEY_ULIST_ENDPOINTS[0]
 const EASTMONEY_CLIST_ENDPOINTS = [
+  'https://82.push2.eastmoney.com/api/qt/clist/get',
+  'https://push2.eastmoney.com/api/qt/clist/get',
   'http://82.push2.eastmoney.com/api/qt/clist/get',
   'http://push2.eastmoney.com/api/qt/clist/get'
 ]
 const EASTMONEY_CLIST_FIELDS = 'f12,f14,f2,f3,f5,f6,f8,f15,f16,f17,f18'
 const EASTMONEY_A_SHARE_FS = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048'
+const EASTMONEY_STOCK_LIST_ENDPOINTS = [
+  'https://push2.eastmoney.com/api/qt/clist/get',
+  'https://57.push2.eastmoney.com/api/qt/clist/get',
+  'https://80.push2.eastmoney.com/api/qt/clist/get',
+  'http://push2.eastmoney.com/api/qt/clist/get'
+]
+const EASTMONEY_STOCK_LIST_FS_CANDIDATES = [
+  {
+    source: 'eastmoney_clist_spot',
+    fs: 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048'
+  },
+  {
+    source: 'eastmoney_clist_spot_alt',
+    fs: 'm:0+t:6+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2'
+  }
+]
+const EASTMONEY_STOCK_LIST_FIELDS = 'f12,f13,f14'
+const EASTMONEY_STOCK_LIST_HEADERS = {
+  Referer: 'https://quote.eastmoney.com/center/gridlist.html',
+  Origin: 'https://quote.eastmoney.com',
+  'Cache-Control': 'no-cache',
+  Pragma: 'no-cache'
+}
+const STOCK_LIST_SH_PREFIXES = ['600', '601', '603', '605', '688', '689']
+const STOCK_LIST_SZ_PREFIXES = ['000', '001', '002', '003', '300', '301']
+const STOCK_LIST_BJ_PREFIXES = [
+  '920', '430', '831', '832', '833', '834', '835', '836', '837', '838', '839',
+  '870', '871', '872', '873', '889'
+]
 const TENCENT_FQKLINE_ENDPOINT = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
+const STOCK_REQUEST_DEFAULT_CONCURRENCY = 5
+const STOCK_REQUEST_MIN_CONCURRENCY = 3
+const STOCK_REQUEST_MAX_CONCURRENCY = 10
+const REQUEST_JITTER_MIN_MS = 500
+const REQUEST_JITTER_MAX_MS = 1500
+const REQUEST_RETRY_BACKOFF_BASE_MS = 1000
+const REQUEST_HOST_MIN_INTERVAL_MS = 350
+const EASTMONEY_HISTORY_ENDPOINTS = [
+  'https://push2his.eastmoney.com/api/qt/stock/kline/get',
+  'http://push2his.eastmoney.com/api/qt/stock/kline/get'
+]
 const EASTMONEY_ULIST_BATCH_SIZE = 200
 const EASTMONEY_ULIST_CONCURRENCY = 1
-const EASTMONEY_REQUEST_RETRIES = 1
-const EASTMONEY_RETRY_DELAY_MS = 350
-const EASTMONEY_REQUEST_TIMEOUT_MS = 6000
+const EASTMONEY_REQUEST_RETRIES = 3
+const EASTMONEY_RETRY_DELAY_MS = REQUEST_RETRY_BACKOFF_BASE_MS
+const EASTMONEY_REQUEST_TIMEOUT_MS = 18000
+const SNAPSHOT_REQUEST_RETRIES = 1
+const SNAPSHOT_REQUEST_TIMEOUT_MS = 6000
+const SNAPSHOT_REFRESH_MAX_MS = 45000
+const SNAPSHOT_ULIST_TIMEOUT_MS = 30000
+const SNAPSHOT_CLIST_ENDPOINTS = [
+  'https://push2.eastmoney.com/api/qt/clist/get',
+  'https://82.push2.eastmoney.com/api/qt/clist/get'
+]
 const EASTMONEY_ALL_MARKET_TIMEOUT_MS = 30000
 const EASTMONEY_ALL_MARKET_CACHE_MS = 5 * 60 * 1000
 const EASTMONEY_CLIST_PAGE_SIZE = 200
@@ -42,7 +96,7 @@ const FULL_HISTORY_STOCK_LIST_FILE = path.join(FULL_HISTORY_CACHE_DIR, 'all-mark
 const FULL_HISTORY_DATE_INDEX_FILE = path.join(FULL_HISTORY_CACHE_DIR, 'all-market-history-date-index.json')
 const FULL_HISTORY_DAILY_CACHE_VERSION = 1
 const FULL_HISTORY_DAILY_BATCH_SIZE = 80
-const FULL_HISTORY_DAILY_CONCURRENCY = 8
+const FULL_HISTORY_DAILY_CONCURRENCY = STOCK_REQUEST_DEFAULT_CONCURRENCY
 const FULL_HISTORY_DEFAULT_DELAY_MS = 1500
 const FULL_HISTORY_MIN_DELAY_MS = 500
 const FULL_HISTORY_MAX_DELAY_MS = 60000
@@ -53,6 +107,7 @@ const EASTMONEY_ALL_MARKET_SCAN_RANGES = [
   { market: '1', start: 688000, end: 689999 },
   { market: '0', start: 920000, end: 920999 }
 ]
+// 运行时缓存只存在于当前窗口进程，用于减少 token、全市场快照和历史同步状态的重复计算。
 let accessTokenCache = {
   refreshToken: '',
   accessToken: '',
@@ -63,10 +118,12 @@ let eastmoneyAllSpotCache = {
   result: null
 }
 let fullHistoryJob = createFullHistoryJob({ status: 'idle', message: '尚未开始全市场历史同步' })
-const DESKTOP_WINDOW_URL = 'index.html?window=desktop'
+const DESKTOP_WINDOW_BASE_URL = 'index.html'
 const DESKTOP_WINDOW_FEATURE_CODES = new Set(['stock-review', 'stock-pool', 'risk-watch'])
 let stockReviewDesktopWindow = null
+let lastDesktopWindowUrl = ''
 
+// 判断当前是否已经在独立桌面窗口中，避免启动入口递归创建新窗口。
 function isDesktopWindowContext() {
   const api = getUtoolsApi()
   try {
@@ -100,7 +157,8 @@ function hideUtoolsMainWindow() {
 function isUsableDesktopWindow(win) {
   if (!win) return false
   try {
-    return typeof win.isDestroyed === 'function' ? !win.isDestroyed() : true
+    if (typeof win.isDestroyed === 'function') return !win.isDestroyed()
+    return typeof win.show === 'function' || typeof win.focus === 'function'
   } catch {
     return false
   }
@@ -121,17 +179,107 @@ function focusDesktopWindow(win) {
   }
 }
 
-function openDesktopWindow() {
+function buildDesktopWindowUrl() {
+  return `${DESKTOP_WINDOW_BASE_URL}?window=desktop&launch=${Date.now()}`
+}
+
+function clearDesktopWindowReference(win) {
+  if (!win || stockReviewDesktopWindow === win) {
+    stockReviewDesktopWindow = null
+  }
+}
+
+// 监听窗口关闭和加载失败，及时清理引用或尝试重新加载桌面页面。
+function attachDesktopWindowEvents(win) {
+  if (!win?.on) return
+  const clear = () => clearDesktopWindowReference(win)
+  try {
+    win.on('close', clear)
+    win.on('closed', clear)
+  } catch {}
+
+  const webContents = win.webContents
+  if (!webContents?.on) return
+  try {
+    webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
+      if (typeof console !== 'undefined') {
+        console.warn('[desktop-window] load failed', errorCode, errorDescription)
+      }
+      setTimeout(() => reloadDesktopWindow(win), 500)
+    })
+    webContents.on('render-process-gone', clear)
+  } catch {}
+}
+
+function reloadDesktopWindow(win) {
+  if (!isUsableDesktopWindow(win)) return false
+  const url = buildDesktopWindowUrl()
+  lastDesktopWindowUrl = url
+  try {
+    if (typeof win.loadURL === 'function') {
+      win.loadURL(url)
+      return true
+    }
+    if (typeof win.loadFile === 'function') {
+      win.loadFile(DESKTOP_WINDOW_BASE_URL, { query: { window: 'desktop', launch: String(Date.now()) } })
+      return true
+    }
+    if (typeof win.webContents?.loadURL === 'function') {
+      win.webContents.loadURL(url)
+      return true
+    }
+    if (typeof win.webContents?.reloadIgnoringCache === 'function') {
+      win.webContents.reloadIgnoringCache()
+      return true
+    }
+  } catch (error) {
+    if (typeof console !== 'undefined') console.warn('[desktop-window] reload failed', error)
+  }
+  return false
+}
+
+// 独立窗口打开后检查 React 是否挂载成功，没挂上时自动重载一次。
+function verifyDesktopWindowLoaded(win, attempt = 0) {
+  if (!isUsableDesktopWindow(win)) return
+  setTimeout(async () => {
+    if (!isUsableDesktopWindow(win)) return
+    const webContents = win.webContents
+    if (typeof webContents?.executeJavaScript !== 'function') return
+    try {
+      const mounted = await webContents.executeJavaScript(
+        "Boolean(document.querySelector('[data-stock-review-app=\"desktop\"]'))",
+        true
+      )
+      if (mounted) return
+    } catch {
+      return
+    }
+
+    if (attempt >= 1) return
+    if (typeof console !== 'undefined') console.warn('[desktop-window] app content not mounted, reload once')
+    if (reloadDesktopWindow(win)) verifyDesktopWindowLoaded(win, attempt + 1)
+  }, attempt ? 3000 : 1800)
+}
+
+function openDesktopWindow(options = {}) {
   hideUtoolsMainWindow()
 
   if (focusDesktopWindow(stockReviewDesktopWindow)) {
+    if (options.forceReload) {
+      reloadDesktopWindow(stockReviewDesktopWindow)
+    }
+    if (options.verify !== false) {
+      verifyDesktopWindowLoaded(stockReviewDesktopWindow)
+    }
     return stockReviewDesktopWindow
   }
 
+  clearDesktopWindowReference(stockReviewDesktopWindow)
   const api = getUtoolsApi()
   if (!api?.createBrowserWindow) return null
 
-  stockReviewDesktopWindow = api.createBrowserWindow(DESKTOP_WINDOW_URL, {
+  lastDesktopWindowUrl = buildDesktopWindowUrl()
+  stockReviewDesktopWindow = api.createBrowserWindow(lastDesktopWindowUrl, {
     width: 1600,
     height: 900,
     minWidth: 1366,
@@ -147,13 +295,11 @@ function openDesktopWindow() {
     }
   }, () => {
     focusDesktopWindow(stockReviewDesktopWindow)
+    verifyDesktopWindowLoaded(stockReviewDesktopWindow)
   })
 
-  if (stockReviewDesktopWindow?.on) {
-    stockReviewDesktopWindow.on('closed', () => {
-      stockReviewDesktopWindow = null
-    })
-  }
+  attachDesktopWindowEvents(stockReviewDesktopWindow)
+  verifyDesktopWindowLoaded(stockReviewDesktopWindow)
 
   return stockReviewDesktopWindow
 }
@@ -167,20 +313,148 @@ function setupDesktopWindowLauncher() {
   api.onPluginEnter(action => {
     const code = action?.code
     if (code && !DESKTOP_WINDOW_FEATURE_CODES.has(code)) return
-    openDesktopWindow()
+    openDesktopWindow({ verify: true })
   })
 }
 
 setupDesktopWindowLauncher()
+
+// 所有外部行情请求共用 agent 和主机锁，控制并发与请求间隔，降低被限流概率。
+const HTTP_AGENT = new http.Agent({ keepAlive: false, maxSockets: STOCK_REQUEST_MAX_CONCURRENCY })
+const HTTPS_AGENT = new https.Agent({ keepAlive: false, maxSockets: STOCK_REQUEST_MAX_CONCURRENCY })
+const requestHostLocks = new Map()
+const requestHostLastStartAt = new Map()
+
+function normalizeTimeoutMs(value, fallback = EASTMONEY_REQUEST_TIMEOUT_MS) {
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? Math.trunc(number) : fallback
+}
+
+function normalizeDeadlineAt(value) {
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? number : 0
+}
+
+function isDeadlineExceeded(deadlineAt) {
+  const deadline = normalizeDeadlineAt(deadlineAt)
+  return Boolean(deadline && Date.now() >= deadline)
+}
+
+function getRemainingDeadlineMs(deadlineAt, fallback = Infinity) {
+  const deadline = normalizeDeadlineAt(deadlineAt)
+  if (!deadline) return fallback
+  return Math.max(0, deadline - Date.now())
+}
+
+function createDeadlineError(label = '请求') {
+  const error = new Error(`${label}超过最大等待时间`)
+  error.code = 'ETIMEDOUT'
+  return error
+}
+
+function timeoutWithinDeadline(timeoutMs, deadlineAt, label = '请求') {
+  const timeout = normalizeTimeoutMs(timeoutMs)
+  const deadline = normalizeDeadlineAt(deadlineAt)
+  if (!deadline) return timeout
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) throw createDeadlineError(label)
+  return Math.max(1, Math.min(timeout, remaining))
+}
+
+function clampStockRequestConcurrency(value, fallback = STOCK_REQUEST_DEFAULT_CONCURRENCY) {
+  const number = Number(value)
+  const concurrency = Number.isFinite(number) && number > 0 ? Math.trunc(number) : fallback
+  return Math.max(STOCK_REQUEST_MIN_CONCURRENCY, Math.min(STOCK_REQUEST_MAX_CONCURRENCY, concurrency))
+}
+
+function randomDelayMs(min = REQUEST_JITTER_MIN_MS, max = REQUEST_JITTER_MAX_MS) {
+  const lower = Math.max(0, Math.trunc(min))
+  const upper = Math.max(lower, Math.trunc(max))
+  return lower + Math.floor(Math.random() * (upper - lower + 1))
+}
+
+function requestLogUrl(url) {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.origin}${parsed.pathname}`
+  } catch {
+    return String(url || '').slice(0, 160)
+  }
+}
+
+function errorMessage(error) {
+  return String(error?.message || error || 'request failed')
+}
+
+function historyDisplayError(error) {
+  if (isRetryableRequestError(error)) {
+    return '网络中断或接口限流，已记录失败，可稍后补跑'
+  }
+  return errorMessage(error)
+}
+
+function isRetryableRequestError(error) {
+  const code = String(error?.code || '').toUpperCase()
+  const message = errorMessage(error).toLowerCase()
+  const statusCode = Number(error?.statusCode || error?.status || 0)
+  if (['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EPIPE'].includes(code)) return true
+  if (message.includes('socket hang up')) return true
+  if (message.includes('timeout') || message.includes('timed out')) return true
+  return statusCode === 429 || (statusCode >= 500 && statusCode < 600)
+}
+
+function createHttpError(statusCode, text) {
+  const error = new Error(`HTTP ${statusCode}: ${String(text || '').slice(0, 240)}`)
+  error.statusCode = statusCode
+  return error
+}
+
+function requestHostKey(url) {
+  try {
+    return new URL(url).host
+  } catch {
+    return 'default'
+  }
+}
+
+async function waitForRequestSlot(url, minIntervalMs = REQUEST_HOST_MIN_INTERVAL_MS) {
+  const host = requestHostKey(url)
+  const interval = Math.max(0, Math.trunc(Number(minIntervalMs) || 0))
+  const previous = requestHostLocks.get(host) || Promise.resolve()
+  let release
+  const current = new Promise(resolve => {
+    release = resolve
+  })
+  const chained = previous.catch(() => {}).then(() => current)
+  requestHostLocks.set(host, chained)
+  await previous.catch(() => {})
+
+  try {
+    const lastStartAt = requestHostLastStartAt.get(host) || 0
+    const waitMs = Math.max(0, lastStartAt + interval - Date.now())
+    if (waitMs) await sleep(waitMs)
+    requestHostLastStartAt.set(host, Date.now())
+  } finally {
+    release()
+    if (requestHostLocks.get(host) === chained) {
+      requestHostLocks.delete(host)
+    }
+  }
+}
 
 function postJson(url, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const payload = body == null ? '' : JSON.stringify(body)
     const req = https.request(url, {
       method: 'POST',
+      agent: HTTPS_AGENT,
       headers: {
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(payload),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        Connection: 'close',
         ...headers
       },
       timeout: 30000
@@ -206,7 +480,9 @@ function postJson(url, body, headers = {}) {
     })
 
     req.on('timeout', () => {
-      req.destroy(new Error('同花顺接口请求超时'))
+      const error = new Error('iFinD request timeout')
+      error.code = 'ETIMEDOUT'
+      req.destroy(error)
     })
     req.on('error', reject)
     if (payload) req.write(payload)
@@ -214,24 +490,35 @@ function postJson(url, body, headers = {}) {
   })
 }
 
-function getJson(url, headers = {}, timeout = 30000) {
+function getJson(url, headers = {}, timeout = EASTMONEY_REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const client = String(url).startsWith('http://') ? http : https
+    const timeoutMs = normalizeTimeoutMs(timeout)
     const req = client.request(url, {
       method: 'GET',
+      agent: client === http ? HTTP_AGENT : HTTPS_AGENT,
       headers: {
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         Referer: 'http://quote.eastmoney.com/',
-        'User-Agent': 'Mozilla/5.0',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        Connection: 'close',
         ...headers
       },
-      timeout
+      timeout: timeoutMs
     }, res => {
       const chunks = []
       res.on('data', chunk => chunks.push(chunk))
+      res.on('aborted', () => {
+        const error = new Error('response aborted')
+        error.code = 'ECONNRESET'
+        reject(error)
+      })
+      res.on('error', reject)
       res.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8')
         if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error(`HTTP ${res.statusCode}：${text.slice(0, 240)}`))
+          reject(createHttpError(res.statusCode, text))
           return
         }
         let jsonText = text.trim()
@@ -245,7 +532,9 @@ function getJson(url, headers = {}, timeout = 30000) {
       })
     })
     req.on('timeout', () => {
-      req.destroy(new Error('接口请求超时'))
+      const error = new Error(`request timeout after ${timeoutMs}ms`)
+      error.code = 'ETIMEDOUT'
+      req.destroy(error)
     })
     req.on('error', reject)
     req.end()
@@ -256,25 +545,67 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function getJsonWithRetry(url, headers = {}, retries = EASTMONEY_REQUEST_RETRIES, timeout = EASTMONEY_REQUEST_TIMEOUT_MS) {
+// 外部接口统一走重试、退避、截止时间和错误标记，调用方只需要关心业务结果。
+async function requestWithRetry(requestFn, options = {}) {
+  const retries = Math.max(0, Math.trunc(Number.isFinite(Number(options.retries)) ? Number(options.retries) : EASTMONEY_REQUEST_RETRIES))
+  const label = options.label || 'request'
+  const logUrl = requestLogUrl(options.url)
+  const deadlineAt = normalizeDeadlineAt(options.deadlineAt)
   let lastError
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (deadlineAt && Date.now() >= deadlineAt) {
+      throw lastError || createDeadlineError(label)
+    }
+    const jitterMs = randomDelayMs()
+    await sleep(deadlineAt ? Math.min(jitterMs, Math.max(0, deadlineAt - Date.now())) : jitterMs)
+    if (deadlineAt && Date.now() >= deadlineAt) {
+      throw lastError || createDeadlineError(label)
+    }
     try {
-      return await getJson(url, headers, timeout)
+      await waitForRequestSlot(options.url, options.minIntervalMs ?? REQUEST_HOST_MIN_INTERVAL_MS)
+      return await requestFn({ attempt, retries })
     } catch (error) {
       lastError = error
-      if (attempt >= retries) break
-      await sleep(EASTMONEY_RETRY_DELAY_MS * (attempt + 1))
+      if (options.url && !error.requestUrl) error.requestUrl = options.url
+      error.attempts = attempt + 1
+      if (attempt >= retries || !isRetryableRequestError(error)) break
+      const baseDelay = EASTMONEY_RETRY_DELAY_MS * Math.pow(2, attempt)
+      const delayMs = baseDelay + randomDelayMs(REQUEST_JITTER_MIN_MS, REQUEST_JITTER_MAX_MS)
+      if (typeof options.onRetry === 'function') {
+        try {
+          options.onRetry({ attempt: attempt + 1, retries, delayMs, error, url: options.url })
+        } catch {}
+      }
+      if (typeof console !== 'undefined' && options.logRetries !== false) {
+        console.info(`[requestWithRetry] ${label} retry ${attempt + 1}/${retries} in ${delayMs}ms: ${errorMessage(error)} (${logUrl})`)
+      }
+      await sleep(deadlineAt ? Math.min(delayMs, Math.max(0, deadlineAt - Date.now())) : delayMs)
     }
   }
   throw lastError
+}
+
+async function getJsonWithRetry(url, headers = {}, retriesOrOptions = EASTMONEY_REQUEST_RETRIES, timeout = EASTMONEY_REQUEST_TIMEOUT_MS) {
+  const options = retriesOrOptions && typeof retriesOrOptions === 'object'
+    ? { ...retriesOrOptions }
+    : { retries: retriesOrOptions, timeout }
+  const timeoutMs = normalizeTimeoutMs(options.timeoutMs ?? options.timeout, EASTMONEY_REQUEST_TIMEOUT_MS)
+  return requestWithRetry(
+    () => getJson(url, headers, timeoutWithinDeadline(timeoutMs, options.deadlineAt, options.label || 'GET')),
+    {
+      ...options,
+      timeoutMs,
+      url,
+      label: options.label || 'GET'
+    }
+  )
 }
 
 async function getFirstJson(urls, action) {
   const errors = []
   for (const url of urls) {
     try {
-      return await getJson(url)
+      return await getJsonWithRetry(url, {}, { label: action })
     } catch (error) {
       let host = url
       try {
@@ -284,6 +615,57 @@ async function getFirstJson(urls, action) {
     }
   }
   throw new Error(`${action}失败：${errors.join('；')}`)
+}
+
+function createRequestProgress(total, label) {
+  return {
+    total,
+    label,
+    completed: 0,
+    success: 0,
+    failed: 0,
+    retries: 0,
+    logEvery: Math.max(10, Math.ceil(Math.max(1, total) / 100))
+  }
+}
+
+function logRequestProgress(progress, force = false) {
+  if (!progress || !progress.total || typeof console === 'undefined') return
+  if (!force && progress.completed < progress.total && progress.completed % progress.logEvery !== 0) return
+  console.info(`[${progress.label}] progress ${progress.completed}/${progress.total}, success ${progress.success}, failed ${progress.failed}, retries ${progress.retries}`)
+}
+
+// 简单并发队列：全市场股票请求量很大，用固定 worker 数逐项消费。
+async function runRequestQueue(items, handler, options = {}) {
+  const list = Array.isArray(items) ? items : []
+  if (!list.length) return
+  const concurrency = clampStockRequestConcurrency(options.concurrency)
+  let cursor = 0
+  async function worker() {
+    while (cursor < list.length) {
+      if (typeof options.shouldStop === 'function' && options.shouldStop()) return
+      const index = cursor
+      cursor += 1
+      await handler(list[index], index)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, () => worker()))
+}
+
+function createFailedTask({ code, name, url, error, source, date, startDate, endDate, adjust }) {
+  return {
+    code: normalizeCacheCode(code || ''),
+    name: String(name || code || '').trim(),
+    url: String(url || error?.requestUrl || ''),
+    errorMessage: errorMessage(error),
+    errorCode: String(error?.code || error?.statusCode || ''),
+    source: source || 'eastmoney_history',
+    date: date || '',
+    startDate: startDate || '',
+    endDate: endDate || '',
+    adjust: adjust || '',
+    failedAt: new Date().toISOString()
+  }
 }
 
 function assertIfindSuccess(payload, action) {
@@ -501,7 +883,7 @@ async function fetchTencentHistory(options, fallbackError = null) {
         count: 1000
       }),
       tencentHeaders(code),
-      1,
+      options.retries ?? EASTMONEY_REQUEST_RETRIES,
       EASTMONEY_REQUEST_TIMEOUT_MS
     )
     const rows = normalizeTencentKlineRows(code, payload, options)
@@ -532,7 +914,7 @@ async function fetchTencentSpot(options, fallbackError = null) {
     const payload = await getJsonWithRetry(
       buildTencentFqklineUrl(code, { adjust: '1', count: 1 }),
       tencentHeaders(code),
-      1,
+      options.retries ?? EASTMONEY_REQUEST_RETRIES,
       EASTMONEY_REQUEST_TIMEOUT_MS
     )
     const [fallbackRow] = normalizeTencentKlineRows(code, payload, { adjust: '1' }).slice(-1)
@@ -598,6 +980,168 @@ function eastmoneySpotRowToTable(item, today) {
   }])
 }
 
+function hasAnyPrefix(value, prefixes) {
+  return prefixes.some(prefix => String(value || '').startsWith(prefix))
+}
+
+function inferStockListMarket(symbol, f13, rawCode = '') {
+  const text = String(symbol || '').trim().padStart(6, '0')
+  const raw = String(rawCode || '').trim().toLowerCase()
+
+  if (raw.startsWith('sh.') || hasAnyPrefix(text, STOCK_LIST_SH_PREFIXES)) return 'SH'
+  if (raw.startsWith('sz.') || hasAnyPrefix(text, STOCK_LIST_SZ_PREFIXES)) return 'SZ'
+  if (raw.startsWith('bj.') || hasAnyPrefix(text, STOCK_LIST_BJ_PREFIXES)) return 'BJ'
+  if (String(f13) === '1') return 'SH'
+  if (String(f13) === '0') return 'SZ'
+  return ''
+}
+
+function normalizeStockListItem(raw, source) {
+  const symbol = String(raw?.f12 || raw?.symbol || raw?.code || '').trim().padStart(6, '0')
+  const name = String(raw?.f14 || raw?.name || raw?.stockName || '').trim()
+  if (!/^\d{6}$/.test(symbol) || !name || symbol === '000000') return null
+
+  const market = inferStockListMarket(symbol, raw?.f13, raw?.code || raw?.rawCode || '')
+  if (!market) return null
+  return {
+    code: `${symbol}.${market}`,
+    symbol,
+    market,
+    name,
+    source
+  }
+}
+
+function dedupeAndSortStockList(items) {
+  const map = new Map()
+  ;(items || []).forEach(item => {
+    if (item?.code) map.set(item.code, item)
+  })
+  return Array.from(map.values()).sort((a, b) => (
+    String(a.market || '').localeCompare(String(b.market || '')) ||
+    String(a.symbol || '').localeCompare(String(b.symbol || ''))
+  ))
+}
+
+function stockListItemsToHistoryItems(stocks) {
+  return (stocks || []).map(item => ({
+    code: normalizeCacheCode(item.code || ''),
+    name: String(item.name || item.code || '').trim(),
+    status: 'pending',
+    rowCount: 0,
+    failedCount: 0,
+    skippedCount: 0,
+    message: '未获取',
+    updatedAt: null
+  })).filter(item => item.code)
+}
+
+function buildEastmoneyStockListUrl(endpoint, fsFilter, page, pageSize) {
+  const url = new URL(endpoint)
+  url.searchParams.set('pn', String(page))
+  url.searchParams.set('pz', String(pageSize))
+  url.searchParams.set('po', '1')
+  url.searchParams.set('np', '1')
+  url.searchParams.set('ut', 'bd1d9ddb04089700cf9c27f6f7426281')
+  url.searchParams.set('fltt', '2')
+  url.searchParams.set('invt', '2')
+  url.searchParams.set('fid', 'f12')
+  url.searchParams.set('fs', fsFilter)
+  url.searchParams.set('fields', EASTMONEY_STOCK_LIST_FIELDS)
+  url.searchParams.set('_', String(Date.now()))
+  return url.toString()
+}
+
+async function fetchEastmoneyStockListPage(endpoint, fsFilter, page, pageSize, options = {}) {
+  const requestUrl = buildEastmoneyStockListUrl(endpoint, fsFilter, page, pageSize)
+  const payload = await getJsonWithRetry(
+    requestUrl,
+    EASTMONEY_STOCK_LIST_HEADERS,
+    {
+      retries: options.retries ?? SNAPSHOT_REQUEST_RETRIES,
+      timeoutMs: options.timeoutMs ?? 10000,
+      deadlineAt: options.deadlineAt,
+      label: `eastmoney-stock-list page ${page}`,
+      logRetries: options.logRetries
+    }
+  )
+  return payload?.data || { diff: [], total: 0 }
+}
+
+async function fetchEastmoneyStockListFromCandidate(endpoint, candidate, options = {}) {
+  const pageSize = Math.max(50, Math.min(500, Number(options.pageSize) || 500))
+  const collected = []
+  let page = 1
+  let total = 0
+
+  while (!isDeadlineExceeded(options.deadlineAt)) {
+    const data = await fetchEastmoneyStockListPage(endpoint, candidate.fs, page, pageSize, options)
+    const rows = Array.isArray(data.diff) ? data.diff : []
+    if (page === 1) total = Number(data.total) || rows.length
+    if (!rows.length) break
+
+    rows.forEach(row => {
+      const item = normalizeStockListItem(row, candidate.source)
+      if (item) collected.push(item)
+    })
+
+    if (total && page * pageSize >= total) break
+    page += 1
+  }
+
+  if (isDeadlineExceeded(options.deadlineAt)) throw createDeadlineError('eastmoney-stock-list')
+
+  const stocks = dedupeAndSortStockList(collected)
+  if (stocks.length < 1000) {
+    throw new Error(`eastmoney stock list too small: ${stocks.length}, total=${total}`)
+  }
+  return {
+    source: candidate.source,
+    endpoint,
+    stocks,
+    meta: {
+      total,
+      stockCount: stocks.length,
+      pages: page
+    }
+  }
+}
+
+async function fetchFullMarketAStockList(options = {}) {
+  const errors = []
+  const endpoints = Array.isArray(options.endpoints) && options.endpoints.length
+    ? options.endpoints
+    : EASTMONEY_STOCK_LIST_ENDPOINTS
+  const candidates = Array.isArray(options.fsCandidates) && options.fsCandidates.length
+    ? options.fsCandidates
+    : EASTMONEY_STOCK_LIST_FS_CANDIDATES
+
+  try {
+    return await fetchBaostockStockList(options)
+  } catch (error) {
+    errors.push(`baostock: ${errorMessage(error)}`)
+  }
+
+  if (isDeadlineExceeded(options.deadlineAt)) {
+    throw new Error(`all stock list sources failed: ${errors.join('; ')}`)
+  }
+
+  for (const candidate of candidates) {
+    for (const endpoint of endpoints) {
+      if (isDeadlineExceeded(options.deadlineAt)) {
+        throw new Error(`all stock list sources failed: ${errors.join('; ')}`)
+      }
+      try {
+        return await fetchEastmoneyStockListFromCandidate(endpoint, candidate, options)
+      } catch (error) {
+        errors.push(`${endpoint} / ${candidate.source}: ${errorMessage(error)}`)
+      }
+    }
+  }
+
+  throw new Error(`all stock list sources failed: ${errors.join('; ')}`)
+}
+
 function buildEastmoneyAllMarketSecids() {
   const secids = []
   EASTMONEY_ALL_MARKET_SCAN_RANGES.forEach(range => {
@@ -608,8 +1152,8 @@ function buildEastmoneyAllMarketSecids() {
   return secids
 }
 
-function buildEastmoneyUlistUrl(secids) {
-  const url = new URL(EASTMONEY_ULIST_ENDPOINT)
+function buildEastmoneyUlistUrl(secids, endpoint = EASTMONEY_ULIST_ENDPOINT) {
+  const url = new URL(endpoint)
   url.searchParams.set('secids', secids.join(','))
   url.searchParams.set('fields', EASTMONEY_SPOT_FIELDS)
   url.searchParams.set('fltt', '2')
@@ -645,15 +1189,27 @@ function buildEastmoneyClistUrl(endpoint, page, pageSize) {
   return url.toString()
 }
 
-async function fetchEastmoneyClistPage(page, pageSize) {
+async function fetchEastmoneyClistPage(page, pageSize, options = {}) {
   let lastError
-  for (const endpoint of EASTMONEY_CLIST_ENDPOINTS) {
+  const endpoints = Array.isArray(options.endpoints) && options.endpoints.length
+    ? options.endpoints
+    : EASTMONEY_CLIST_ENDPOINTS
+  for (const endpoint of endpoints) {
+    if (isDeadlineExceeded(options.deadlineAt)) {
+      throw lastError || createDeadlineError(`eastmoney-clist page ${page}`)
+    }
     try {
+      const requestUrl = buildEastmoneyClistUrl(endpoint, page, pageSize)
       const payload = await getJsonWithRetry(
-        buildEastmoneyClistUrl(endpoint, page, pageSize),
+        requestUrl,
         {},
-        2,
-        10000
+        {
+          retries: options.retries ?? EASTMONEY_REQUEST_RETRIES,
+          timeoutMs: options.timeoutMs ?? EASTMONEY_REQUEST_TIMEOUT_MS,
+          deadlineAt: options.deadlineAt,
+          label: `eastmoney-clist page ${page}`,
+          logRetries: options.logRetries
+        }
       )
       return payload?.data || { diff: [], total: 0 }
     } catch (error) {
@@ -689,7 +1245,39 @@ async function fetchEastmoneyClistSpot(options = {}) {
     return fetchEastmoneySpot({ codes: Array.from(wantedCodes).join(',') })
   }
 
-  const firstPage = await fetchEastmoneyClistPage(page, pageSize)
+  let firstPage
+  try {
+    firstPage = await fetchEastmoneyClistPage(page, pageSize, options)
+  } catch (error) {
+    if (options.fallbackToUlist !== false && !wantedCodes.size) {
+      const fallbackTimeoutMs = Math.max(
+        1000,
+        Math.min(
+          Number(options.fallbackTimeoutMs) || 90000,
+          getRemainingDeadlineMs(options.deadlineAt, Number(options.fallbackTimeoutMs) || 90000)
+        )
+      )
+      const fallback = await fetchEastmoneyAllMarketSpot({
+        ...options,
+        concurrency: Math.max(1, Math.min(2, Number(options.concurrency) || 1)),
+        batchSize: Number(options.batchSize) || EASTMONEY_ULIST_BATCH_SIZE,
+        timeoutMs: fallbackTimeoutMs,
+        requestTimeoutMs: options.timeoutMs ?? EASTMONEY_REQUEST_TIMEOUT_MS,
+        deadlineAt: options.deadlineAt,
+        logRetries: options.logRetries
+      })
+      return {
+        ...fallback,
+        endpoint: 'eastmoney_ulist_spot_fallback',
+        meta: {
+          ...(fallback.meta || {}),
+          fallbackFrom: 'eastmoney_clist',
+          fallbackReason: historyDisplayError(error)
+        }
+      }
+    }
+    throw error
+  }
   const firstRows = Array.isArray(firstPage.diff) ? firstPage.diff : []
   total = Number(firstPage.total) || firstRows.length
   fetched += firstRows.length
@@ -705,11 +1293,11 @@ async function fetchEastmoneyClistSpot(options = {}) {
   let cursor = 0
   async function worker() {
     try {
-      while (cursor < remainingPages.length) {
+      while (cursor < remainingPages.length && !isDeadlineExceeded(options.deadlineAt)) {
         const currentPage = remainingPages[cursor]
         cursor += 1
         try {
-          const data = await fetchEastmoneyClistPage(currentPage, pageSize)
+          const data = await fetchEastmoneyClistPage(currentPage, pageSize, options)
           const rows = Array.isArray(data.diff) ? data.diff : []
           fetched += rows.length
           collectRows(rows)
@@ -742,22 +1330,46 @@ async function fetchEastmoneyClistSpot(options = {}) {
   }
 }
 
+async function fetchEastmoneyUlistFromEndpoint(endpoint, secids, options = {}) {
+  const payload = await getJsonWithRetry(
+    buildEastmoneyUlistUrl(secids, endpoint),
+    {},
+    {
+      retries: options.retries ?? EASTMONEY_REQUEST_RETRIES,
+      timeoutMs: options.timeout ?? options.timeoutMs ?? EASTMONEY_REQUEST_TIMEOUT_MS,
+      deadlineAt: options.deadlineAt,
+      label: `eastmoney-ulist ${secids.length}`,
+      logRetries: options.logRetries
+    }
+  )
+  return payload?.data?.diff || []
+}
+
 async function fetchEastmoneyUlist(secids, options = {}) {
+  let lastError
   try {
-    const payload = await getJsonWithRetry(
-      buildEastmoneyUlistUrl(secids),
-      {},
-      options.retries ?? EASTMONEY_REQUEST_RETRIES,
-      options.timeout ?? EASTMONEY_REQUEST_TIMEOUT_MS
-    )
-    return payload?.data?.diff || []
+    for (const endpoint of EASTMONEY_ULIST_ENDPOINTS) {
+      try {
+        return await fetchEastmoneyUlistFromEndpoint(endpoint, secids, options)
+      } catch (error) {
+        lastError = error
+      }
+    }
+    throw lastError
   } catch (error) {
     if (secids.length <= 20) {
+      if (options.allowPartial) return []
       throw error
     }
     const middle = Math.ceil(secids.length / 2)
-    const left = await fetchEastmoneyUlist(secids.slice(0, middle), options)
-    const right = await fetchEastmoneyUlist(secids.slice(middle), options)
+    const left = await fetchEastmoneyUlist(secids.slice(0, middle), options).catch(err => {
+      if (options.allowPartial) return []
+      throw err
+    })
+    const right = await fetchEastmoneyUlist(secids.slice(middle), options).catch(err => {
+      if (options.allowPartial) return []
+      throw err
+    })
     return [...left, ...right]
   }
 }
@@ -778,7 +1390,11 @@ async function fetchEastmoneyAllMarketSpot(options = {}) {
   const secids = buildEastmoneyAllMarketSecids()
   const batchSize = Number(options.batchSize) || EASTMONEY_ULIST_BATCH_SIZE
   const concurrency = Math.max(1, Math.min(8, Number(options.concurrency) || EASTMONEY_ULIST_CONCURRENCY))
-  const timeoutMs = Number(options.timeoutMs) || EASTMONEY_ALL_MARKET_TIMEOUT_MS
+  const timeoutMs = timeoutWithinDeadline(
+    Number(options.timeoutMs) || EASTMONEY_ALL_MARKET_TIMEOUT_MS,
+    options.deadlineAt,
+    'eastmoney-ulist fallback'
+  )
   const probe = Boolean(options.probe)
   const today = new Date().toISOString().slice(0, 10)
   const tables = []
@@ -794,10 +1410,16 @@ async function fetchEastmoneyAllMarketSpot(options = {}) {
   }
 
   async function runBatch(batch) {
-    if (Date.now() - startedAt > timeoutMs) return
+    if (Date.now() - startedAt > timeoutMs || isDeadlineExceeded(options.deadlineAt)) return
     let rows = []
     try {
-      rows = await fetchEastmoneyUlist(batch)
+      rows = await fetchEastmoneyUlist(batch, {
+        allowPartial: true,
+        retries: options.retries ?? EASTMONEY_REQUEST_RETRIES,
+        timeoutMs: options.requestTimeoutMs ?? EASTMONEY_REQUEST_TIMEOUT_MS,
+        deadlineAt: options.deadlineAt,
+        logRetries: options.logRetries
+      })
       completedBatches += 1
     } catch {
       failedBatches += 1
@@ -812,7 +1434,7 @@ async function fetchEastmoneyAllMarketSpot(options = {}) {
   }
 
   async function worker() {
-    while (cursor < batches.length && Date.now() - startedAt <= timeoutMs) {
+    while (cursor < batches.length && Date.now() - startedAt <= timeoutMs && !isDeadlineExceeded(options.deadlineAt)) {
       if (probe && tables.length) return
       const batch = batches[cursor]
       cursor += 1
@@ -862,9 +1484,9 @@ async function fetchEastmoneyAllMarketSpot(options = {}) {
   return result
 }
 
-async function fetchEastmoneyHistoryTable(code, options) {
+function buildEastmoneyHistoryUrl(endpoint, code, options = {}) {
   const { fullCode, secid } = eastmoneySecid(code)
-  const url = new URL('http://push2his.eastmoney.com/api/qt/stock/kline/get')
+  const url = new URL(endpoint)
   url.searchParams.set('secid', secid)
   url.searchParams.set('fields1', 'f1,f2,f3,f4,f5,f6')
   url.searchParams.set('fields2', 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61')
@@ -874,7 +1496,34 @@ async function fetchEastmoneyHistoryTable(code, options) {
   url.searchParams.set('end', ymd(options.endDate, '20500101'))
   url.searchParams.set('lmt', '1000')
   url.searchParams.set('ut', EASTMONEY_UT)
-  const payload = await getJsonWithRetry(url.toString())
+  return { fullCode, requestUrl: url.toString() }
+}
+
+async function fetchEastmoneyHistoryTable(code, options = {}) {
+  const { fullCode } = eastmoneySecid(code)
+  let payload
+  let requestUrl = ''
+  let lastError
+  for (const endpoint of EASTMONEY_HISTORY_ENDPOINTS) {
+    const built = buildEastmoneyHistoryUrl(endpoint, code, options)
+    requestUrl = built.requestUrl
+    try {
+      payload = await getJsonWithRetry(requestUrl, {}, {
+        retries: options.retries ?? EASTMONEY_REQUEST_RETRIES,
+        timeoutMs: options.timeoutMs ?? options.timeout ?? EASTMONEY_REQUEST_TIMEOUT_MS,
+        label: `eastmoney-history ${fullCode}`,
+        onRetry: options.onRetry,
+        logRetries: options.logRetries
+      })
+      break
+    } catch (error) {
+      if (!error.requestUrl) error.requestUrl = requestUrl
+      lastError = error
+    }
+  }
+  if (!payload) {
+    throw lastError || new Error(`东方财富未返回 ${fullCode} 日K数据`)
+  }
   const klines = payload?.data?.klines || []
   const rows = klines.map(line => {
     const [time, open, close, high, low, volume, amount, amplitude, changeRatio, change, turnoverRate] = String(line).split(',')
@@ -891,35 +1540,55 @@ async function fetchEastmoneyHistoryTable(code, options) {
     }
   })
   if (!rows.length) {
-    throw new Error(`东方财富未返回 ${fullCode} 日K数据`)
+    const error = new Error(`东方财富未返回 ${fullCode} 日K数据`)
+    error.requestUrl = requestUrl
+    throw error
   }
   return buildTableFromRows(fullCode, rows)
 }
 
-async function fetchEastmoneyHistory(options) {
+// 按股票代码拉取东方财富历史K线；失败时可按配置回退到腾讯行情接口。
+async function fetchEastmoneyHistory(options = {}) {
   const codes = String(options.codes || '').split(',').map(item => item.trim()).filter(Boolean)
-  const concurrency = Math.max(1, Math.min(8, Number(options.concurrency) || 3))
-  const tolerateErrors = Boolean(options.tolerateErrors)
+  const concurrency = clampStockRequestConcurrency(options.concurrency)
+  const tolerateErrors = options.tolerateErrors !== false || codes.length > 1
   const disableFallback = Boolean(options.disableFallback)
   const tables = []
   const errors = []
-  let cursor = 0
-
-  async function worker() {
-    while (cursor < codes.length) {
-      const code = codes[cursor]
-      cursor += 1
-      try {
-        tables.push(await fetchEastmoneyHistoryTable(code, options))
-      } catch (error) {
-        errors.push(`${code}: ${error.message}`)
-        if (!tolerateErrors) throw error
-      }
-    }
-  }
+  const failedTasks = []
+  const progress = createRequestProgress(codes.length, 'eastmoney-history')
 
   try {
-    await Promise.all(Array.from({ length: concurrency }, () => worker()))
+    await runRequestQueue(codes, async code => {
+      try {
+        tables.push(await fetchEastmoneyHistoryTable(code, {
+          ...options,
+          onRetry: info => {
+            progress.retries += 1
+            if (typeof options.onRetry === 'function') options.onRetry(info)
+          }
+        }))
+        progress.success += 1
+      } catch (error) {
+        const task = createFailedTask({
+          code,
+          name: code,
+          error,
+          source: 'eastmoney_history',
+          startDate: options.startDate || '',
+          endDate: options.endDate || '',
+          adjust: String(options.adjust || '1')
+        })
+        failedTasks.push(task)
+        errors.push(`${task.code || code}: ${task.errorMessage}`)
+        progress.failed += 1
+        if (!tolerateErrors) throw error
+      } finally {
+        progress.completed += 1
+        logRequestProgress(progress)
+      }
+    }, { concurrency })
+    logRequestProgress(progress, true)
 
     if (!tables.length) {
       throw new Error(errors[0] || '东方财富历史K线返回为空')
@@ -929,10 +1598,14 @@ async function fetchEastmoneyHistory(options) {
       ok: true,
       endpoint: 'eastmoney_kline',
       fetchedAt: new Date().toISOString(),
-      payload: { tables },
+      payload: { tables, errors, failedTasks },
       meta: errors.length ? {
         partial: true,
         failed: errors.length,
+        failedTasks: failedTasks.length,
+        concurrency,
+        retries: EASTMONEY_REQUEST_RETRIES,
+        timeoutMs: EASTMONEY_REQUEST_TIMEOUT_MS,
         errors: errors.slice(0, 8)
       } : undefined
     }
@@ -1056,6 +1729,51 @@ function runPythonJson({ pythonPath, script, input, timeout = 120000, label = 'P
     })
     child.stdin.write(JSON.stringify(input || {}))
     child.stdin.end()
+  })
+}
+
+function installBaostockPackage(options = {}) {
+  return new Promise((resolve, reject) => {
+    const python = String(options.pythonPath || '').trim() || 'python'
+    const child = spawn(python, ['-m', 'pip', 'install', 'baostock'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PIP_DISABLE_PIP_VERSION_CHECK: '1',
+        PIP_NO_INPUT: '1'
+      }
+    })
+    const stdout = []
+    const stderr = []
+    const timeout = Math.max(30000, Number(options.timeout) || 300000)
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error('Baostock 安装超时，请检查 Python/pip 或网络环境'))
+    }, timeout)
+
+    child.stdout.on('data', chunk => stdout.push(chunk))
+    child.stderr.on('data', chunk => stderr.push(chunk))
+    child.on('error', error => {
+      clearTimeout(timer)
+      reject(new Error(`无法启动 Python：${error.message}`))
+    })
+    child.on('close', code => {
+      clearTimeout(timer)
+      const outText = Buffer.concat(stdout).toString('utf8')
+      const errText = Buffer.concat(stderr).toString('utf8')
+      if (code !== 0) {
+        reject(new Error(errText || outText || `pip install baostock 退出码 ${code}`))
+        return
+      }
+      resolve({
+        ok: true,
+        python,
+        command: `${python} -m pip install baostock`,
+        stdout: outText,
+        stderr: errText
+      })
+    })
   })
 }
 
@@ -1235,6 +1953,108 @@ finally:
 print(json.dumps({"tables": tables, "errors": errors}, ensure_ascii=False))
 `
 
+const BAOSTOCK_STOCK_LIST_SCRIPT = String.raw`
+import json
+import sys
+
+SH_PREFIXES = ("600", "601", "603", "605", "688", "689")
+SZ_PREFIXES = ("000", "001", "002", "003", "300", "301")
+BJ_PREFIXES = (
+    "920", "430", "831", "832", "833", "834", "835", "836", "837", "838", "839",
+    "870", "871", "872", "873", "889",
+)
+
+def infer_market(symbol, raw_code=""):
+    text = str(symbol or "").strip().zfill(6)
+    raw = str(raw_code or "").strip().lower()
+    if raw.startswith("sh.") or text.startswith(SH_PREFIXES):
+        return "SH"
+    if raw.startswith("sz.") or text.startswith(SZ_PREFIXES):
+        return "SZ"
+    if raw.startswith("bj.") or text.startswith(BJ_PREFIXES):
+        return "BJ"
+    return ""
+
+def normalize_stock(symbol, name, source, raw_code=""):
+    symbol = str(symbol or "").strip().zfill(6)
+    name = str(name or "").strip()
+    if not symbol or symbol == "000000" or not name:
+        return None
+    market = infer_market(symbol, raw_code)
+    if not market:
+        return None
+    return {
+        "code": f"{symbol}.{market}",
+        "symbol": symbol,
+        "market": market,
+        "name": name,
+        "source": source,
+    }
+
+def rows_to_dicts(rs):
+    rows = []
+    fields = list(getattr(rs, "fields", []) or [])
+    while getattr(rs, "error_code", "0") == "0" and rs.next():
+        values = rs.get_row_data()
+        rows.append({fields[i]: values[i] for i in range(min(len(fields), len(values)))})
+    return rows
+
+def dedupe_and_sort(items):
+    data = {}
+    for item in items:
+        if item and item.get("code"):
+            data[item["code"]] = item
+    return sorted(data.values(), key=lambda x: (x.get("market", ""), x.get("symbol", "")))
+
+try:
+    import baostock as bs
+except Exception as exc:
+    raise SystemExit("未安装 Baostock，请先执行：pip install baostock\n" + str(exc))
+
+options = json.loads(sys.stdin.read() or "{}")
+date = str(options.get("date") or "")[:10] or None
+items = []
+name_map = {}
+
+login = bs.login()
+if login.error_code != "0":
+    raise SystemExit(login.error_msg or "Baostock 登录失败")
+
+try:
+    try:
+        basic = bs.query_stock_basic()
+        if getattr(basic, "error_code", "0") == "0":
+            for row in rows_to_dicts(basic):
+                raw_code = str(row.get("code") or "").strip().lower()
+                symbol = raw_code.split(".")[-1].zfill(6)
+                name = str(row.get("code_name") or row.get("codeName") or "").strip()
+                if name:
+                    name_map[raw_code] = name
+                    item = normalize_stock(symbol, name, "baostock_stock_basic", raw_code)
+                    if item:
+                        items.append(item)
+    except TypeError:
+        pass
+
+    all_stock = bs.query_all_stock(day=date) if date else bs.query_all_stock()
+    if getattr(all_stock, "error_code", "0") == "0":
+        for row in rows_to_dicts(all_stock):
+            raw_code = str(row.get("code") or "").strip().lower()
+            symbol = raw_code.split(".")[-1].zfill(6)
+            name = str(row.get("code_name") or row.get("codeName") or name_map.get(raw_code, "")).strip()
+            item = normalize_stock(symbol, name, "baostock_query_all_stock", raw_code)
+            if item:
+                items.append(item)
+finally:
+    bs.logout()
+
+stocks = dedupe_and_sort(items)
+if len(stocks) < 1000:
+    raise SystemExit(f"Baostock 返回数量过少：{len(stocks)}；如今天不是交易日，可传入最近交易日")
+
+print(json.dumps({"stocks": stocks, "stockCount": len(stocks)}, ensure_ascii=False))
+`
+
 function ensureCacheDir() {
   fs.mkdirSync(FREE_HISTORY_CACHE_DIR, { recursive: true })
 }
@@ -1391,35 +2211,88 @@ async function fetchBaostockHistory(options) {
   }
 }
 
-async function fetchEastmoneyHistoryBatch(options = {}) {
-  const codes = String(options.codes || '').split(',').map(item => item.trim()).filter(Boolean)
-  const concurrency = Math.max(1, Math.min(12, Number(options.concurrency) || 6))
-  const tables = []
-  const errors = []
-  let cursor = 0
+async function fetchBaostockStockList(options = {}) {
+  const requestedTimeout = Number(options.baostockTimeoutMs ?? options.timeout) || 120000
+  const timeout = Math.max(
+    1000,
+    Math.min(
+      requestedTimeout,
+      getRemainingDeadlineMs(options.deadlineAt, requestedTimeout)
+    )
+  )
+  const payload = await runPythonJson({
+    pythonPath: options.pythonPath,
+    script: BAOSTOCK_STOCK_LIST_SCRIPT,
+    input: {
+      date: options.date || options.stockListDate || ''
+    },
+    timeout,
+    label: 'Baostock stock list'
+  })
+  const stocks = dedupeAndSortStockList(payload.stocks || [])
+  if (stocks.length < 1000) throw new Error(`Baostock 返回数量过少：${stocks.length}`)
 
-  async function worker() {
-    while (cursor < codes.length) {
-      const code = codes[cursor]
-      cursor += 1
-      try {
-        tables.push(await fetchEastmoneyHistoryTable(code, options))
-      } catch (error) {
-        errors.push({ code: normalizeCacheCode(code), message: error.message })
-      }
+  return {
+    source: 'baostock',
+    endpoint: 'baostock_stock_list',
+    stocks,
+    meta: {
+      stockCount: stocks.length
     }
   }
+}
 
-  await Promise.all(Array.from({ length: Math.min(concurrency, codes.length || 1) }, () => worker()))
+async function fetchEastmoneyHistoryBatch(options = {}) {
+  const codes = String(options.codes || '').split(',').map(item => item.trim()).filter(Boolean)
+  const concurrency = clampStockRequestConcurrency(options.concurrency)
+  const tables = []
+  const errors = []
+  const failedTasks = []
+  const progress = createRequestProgress(codes.length, 'eastmoney-history-batch')
+
+  await runRequestQueue(codes, async code => {
+    try {
+      tables.push(await fetchEastmoneyHistoryTable(code, {
+        ...options,
+        onRetry: info => {
+          progress.retries += 1
+          if (typeof options.onRetry === 'function') options.onRetry(info)
+        }
+      }))
+      progress.success += 1
+    } catch (error) {
+      const task = createFailedTask({
+        code,
+        name: code,
+        error,
+        source: 'eastmoney_history_batch',
+        date: options.startDate && options.startDate === options.endDate ? options.startDate : '',
+        startDate: options.startDate || '',
+        endDate: options.endDate || '',
+        adjust: String(options.adjust || '1')
+      })
+      failedTasks.push(task)
+      errors.push({ code: task.code || normalizeCacheCode(code), message: task.errorMessage, url: task.url, failedAt: task.failedAt })
+      progress.failed += 1
+    } finally {
+      progress.completed += 1
+      logRequestProgress(progress)
+    }
+  }, { concurrency })
+  logRequestProgress(progress, true)
 
   return {
     ok: true,
     endpoint: 'eastmoney_history_batch',
     fetchedAt: new Date().toISOString(),
-    payload: { tables, errors },
+    payload: { tables, errors, failedTasks },
     meta: errors.length ? {
       partial: true,
       failed: errors.length,
+      failedTasks: failedTasks.length,
+      concurrency,
+      retries: EASTMONEY_REQUEST_RETRIES,
+      timeoutMs: EASTMONEY_REQUEST_TIMEOUT_MS,
       errors: errors.slice(0, 8)
     } : undefined
   }
@@ -1476,6 +2349,7 @@ async function fetchAkshareSpotUnsafe(options) {
   return fetchAkshareSpot(options)
 }
 
+// 免费稳定模式：组合实时快照、历史缓存和多个免费后端，生成前端可直接使用的数据包。
 async function fetchFreeStableData(options = {}) {
   const codes = String(options.codes || '').split(',').map(item => item.trim()).filter(Boolean).map(normalizeCacheCode)
   const isAllMarket = !codes.length
@@ -1544,7 +2418,7 @@ async function fetchFreeStableData(options = {}) {
         startDate: windowStart,
         endDate,
         adjust: options.eastmoneyAdjust || '1',
-        concurrency: isAllMarket ? 8 : 6
+        concurrency: options.concurrency || STOCK_REQUEST_DEFAULT_CONCURRENCY
       })
       const eastmoneyTables = Array.isArray(history.payload?.tables) ? history.payload.tables : []
       const eastmoneyCodeSet = new Set(eastmoneyTables.map(table => normalizeCacheCode(table.thscode)))
@@ -1719,8 +2593,15 @@ function normalizeFullHistoryDate(value) {
   return ymdToDateParam(value)
 }
 
+// 创建全市场历史同步任务对象，前端轮询看到的状态都从这里派生。
 function createFullHistoryJob(base = {}, items = []) {
   const rawDates = Array.isArray(base.dates) ? base.dates : []
+  const retryTaskMap = base.retryTaskMap && typeof base.retryTaskMap === 'object'
+    ? Object.fromEntries(Object.entries(base.retryTaskMap).map(([date, codes]) => [
+      normalizeFullHistoryDate(date),
+      Array.from(new Set((Array.isArray(codes) ? codes : []).map(normalizeCacheCode).filter(Boolean)))
+    ]).filter(([date, codes]) => date && codes.length))
+    : null
   return {
     id: base.id || `history-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
     status: base.status || 'idle',
@@ -1729,6 +2610,7 @@ function createFullHistoryJob(base = {}, items = []) {
     endDate: base.endDate || '',
     adjust: String(base.adjust || '1'),
     delayMs: clampFullHistoryDelay(base.delayMs),
+    concurrency: clampStockRequestConcurrency(base.concurrency || FULL_HISTORY_DAILY_CONCURRENCY),
     startedAt: base.startedAt || null,
     finishedAt: base.finishedAt || null,
     currentDate: base.currentDate || '',
@@ -1742,12 +2624,15 @@ function createFullHistoryJob(base = {}, items = []) {
     metaFile: base.metaFile || '',
     fetched: Number(base.fetched) || 0,
     failed: Number(base.failed) || 0,
+    skipped: Number(base.skipped) || 0,
     processed: Number(base.processed) || 0,
     cancelRequested: Boolean(base.cancelRequested),
     errors: Array.isArray(base.errors) ? base.errors : [],
+    failedTasks: Array.isArray(base.failedTasks) ? base.failedTasks : [],
     dailyFiles: Array.isArray(base.dailyFiles) ? base.dailyFiles : [],
     selectedOnly: Boolean(base.selectedOnly),
     selectedCodes: Array.isArray(base.selectedCodes) ? base.selectedCodes.map(normalizeCacheCode).filter(Boolean) : [],
+    retryTaskMap,
     dates: rawDates.map(item => (typeof item === 'string' ? { date: item } : item)).map(item => ({
       date: normalizeFullHistoryDate(item.date || item.time || ''),
       status: item.status || 'pending',
@@ -1755,12 +2640,14 @@ function createFullHistoryJob(base = {}, items = []) {
       processed: Number(item.processed) || 0,
       fetched: Number(item.fetched) || 0,
       failed: Number(item.failed) || 0,
+      skipped: Number(item.skipped) || 0,
       fileName: item.fileName || '',
       filePath: item.filePath || '',
       message: item.message || '',
       startedAt: item.startedAt || null,
       updatedAt: item.updatedAt || null,
-      finishedAt: item.finishedAt || null
+      finishedAt: item.finishedAt || null,
+      failedTasks: Array.isArray(item.failedTasks) ? item.failedTasks : []
     })).filter(item => item.date),
     items: items.map(item => ({
       code: normalizeCacheCode(item.code || item.thscode || ''),
@@ -1768,12 +2655,14 @@ function createFullHistoryJob(base = {}, items = []) {
       status: item.status || 'pending',
       rowCount: Number(item.rowCount) || 0,
       failedCount: Number(item.failedCount) || 0,
+      skippedCount: Number(item.skippedCount) || 0,
       message: item.message || '',
       updatedAt: item.updatedAt || null
     })).filter(item => item.code)
   }
 }
 
+// 将后台任务压缩成前端展示用快照，避免暴露 Promise 和过大的内部结构。
 function buildFullHistorySnapshot(job = fullHistoryJob) {
   const items = Array.isArray(job?.items) ? job.items : []
   const dates = Array.isArray(job?.dates) ? job.dates : []
@@ -1781,11 +2670,13 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
   const legacyFetched = items.filter(item => item.status === 'done').length
   const legacyFailed = items.filter(item => item.status === 'failed').length
   const legacyPending = items.filter(item => item.status === 'pending').length
-  const recordTotal = total * dates.length
+  const recordTotal = dates.length ? dates.reduce((sum, item) => sum + (Number(item.stockCount) || total), 0) : total
   const processed = dates.length ? Number(job?.processed) || dates.reduce((sum, item) => sum + (Number(item.processed) || 0), 0) : legacyFetched + legacyFailed
   const fetched = dates.length ? Number(job?.fetched) || dates.reduce((sum, item) => sum + (Number(item.fetched) || 0), 0) : legacyFetched
   const failed = dates.length ? Number(job?.failed) || dates.reduce((sum, item) => sum + (Number(item.failed) || 0), 0) : legacyFailed
+  const skipped = dates.length ? Number(job?.skipped) || dates.reduce((sum, item) => sum + (Number(item.skipped) || 0), 0) : items.filter(item => item.status === 'skipped').length
   const pending = dates.length ? Math.max(0, recordTotal - processed) : legacyPending
+  const failedTasks = Array.isArray(job?.failedTasks) ? job.failedTasks : []
 
   return {
     id: job?.id || '',
@@ -1795,6 +2686,7 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     endDate: job?.endDate || '',
     adjust: job?.adjust || '1',
     delayMs: clampFullHistoryDelay(job?.delayMs),
+    concurrency: clampStockRequestConcurrency(job?.concurrency || FULL_HISTORY_DAILY_CONCURRENCY),
     startedAt: job?.startedAt || null,
     finishedAt: job?.finishedAt || null,
     currentDate: job?.currentDate || '',
@@ -1813,14 +2705,18 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     processed,
     fetched,
     failed,
+    skipped,
     pending,
     progress: dates.length
       ? (recordTotal ? Math.round((processed / recordTotal) * 10000) / 100 : 0)
       : (total ? Math.round(((fetched + failed) / total) * 10000) / 100 : 0),
     errors: (job?.errors || []).slice(-20),
+    failedTaskCount: failedTasks.length,
+    failedTasks: failedTasks.slice(-200),
     dailyFiles: Array.isArray(job?.dailyFiles) ? job.dailyFiles : [],
     selectedOnly: Boolean(job?.selectedOnly),
     selectedCodes: Array.isArray(job?.selectedCodes) ? job.selectedCodes : [],
+    retryTaskMap: job?.retryTaskMap || null,
     dates: dates.map(item => ({
       date: item.date,
       status: item.status,
@@ -1828,18 +2724,22 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
       processed: Number(item.processed) || 0,
       fetched: Number(item.fetched) || 0,
       failed: Number(item.failed) || 0,
+      skipped: Number(item.skipped) || 0,
       fileName: item.fileName || '',
       filePath: item.filePath || '',
       message: item.message || '',
       startedAt: item.startedAt || null,
       updatedAt: item.updatedAt || null,
-      finishedAt: item.finishedAt || null
+      finishedAt: item.finishedAt || null,
+      failedTaskCount: Array.isArray(item.failedTasks) ? item.failedTasks.length : 0
     })),
     items: items.map(item => ({
       code: item.code,
       name: item.name || item.code,
       status: item.status,
       rowCount: Number(item.rowCount) || 0,
+      failedCount: Number(item.failedCount) || 0,
+      skippedCount: Number(item.skippedCount) || 0,
       message: item.message || '',
       updatedAt: item.updatedAt || null
     }))
@@ -1965,6 +2865,14 @@ function addFullHistoryError(job, message) {
   if (job.errors.length > 200) job.errors = job.errors.slice(-200)
 }
 
+function addFullHistoryFailedTask(job, dayEntry, task) {
+  if (!task?.code) return
+  if (!Array.isArray(job.failedTasks)) job.failedTasks = []
+  if (!Array.isArray(dayEntry.failedTasks)) dayEntry.failedTasks = []
+  job.failedTasks.push(task)
+  dayEntry.failedTasks.push(task)
+}
+
 function buildFullMarketStockListPayload(items, source = 'eastmoney_clist') {
   const stocks = (items || []).map(item => {
     const code = normalizeCacheCode(item.code || item.thscode || '')
@@ -2010,21 +2918,91 @@ function readFullMarketStockList() {
   return items.length ? items : null
 }
 
+function readFullMarketStockListFromDailyCache() {
+  const itemsByCode = new Map()
+  const collect = payload => {
+    const stocks = Array.isArray(payload?.stocks) ? payload.stocks : []
+    stocks.forEach(item => {
+      const code = normalizeCacheCode(item.code || item.thscode || '')
+      if (!code || itemsByCode.has(code)) return
+      itemsByCode.set(code, {
+        code,
+        name: String(item.name || item.stockName || item.code || code).trim(),
+        status: 'pending',
+        rowCount: 0,
+        failedCount: 0,
+        message: '来自本地每日缓存',
+        updatedAt: null
+      })
+    })
+  }
+
+  const dateIndex = readFullHistoryDateIndex()
+  Object.values(dateIndex?.dates || {}).forEach(entry => {
+    const filePath = entry?.filePath || (entry?.date ? getFullHistoryDailyFile(entry.date) : '')
+    if (filePath) collect(readJsonFile(filePath))
+  })
+
+  if (!itemsByCode.size && fs.existsSync(FULL_HISTORY_DAILY_CACHE_DIR)) {
+    try {
+      fs.readdirSync(FULL_HISTORY_DAILY_CACHE_DIR)
+        .filter(fileName => fileName.endsWith('.json'))
+        .forEach(fileName => collect(readJsonFile(path.join(FULL_HISTORY_DAILY_CACHE_DIR, fileName))))
+    } catch {}
+  }
+
+  const items = Array.from(itemsByCode.values()).sort((a, b) => a.code.localeCompare(b.code))
+  return items.length ? items : null
+}
+
+function getFullMarketStockListFallbackItems(previousItems = []) {
+  if (Array.isArray(previousItems) && previousItems.length) return previousItems
+  if (Array.isArray(fullHistoryJob?.items) && fullHistoryJob.items.length) {
+    return fullHistoryJob.items.map(item => ({
+      ...item,
+      status: 'pending',
+      message: item.message || '来自当前任务缓存'
+    }))
+  }
+  return readFullMarketStockListFromDailyCache() || []
+}
+
 async function loadFullMarketHistoryItemsForDaily(options = {}) {
   ensureFullHistoryDir()
+  const cachedItems = readFullMarketStockList()
   if (!options.force) {
-    const cachedItems = readFullMarketStockList()
     if (cachedItems?.length) return cachedItems
   }
 
-  const spot = await fetchEastmoneyClistSpot({
-    codes: '',
-    pageSize: 500,
-    concurrency: 2
-  })
-  const items = extractFullHistoryItemsFromSpot(spot)
+  const maxDurationMs = normalizeTimeoutMs(options.maxDurationMs ?? SNAPSHOT_REFRESH_MAX_MS, SNAPSHOT_REFRESH_MAX_MS)
+  const deadlineAt = Date.now() + maxDurationMs
+  let result
+  try {
+    result = await fetchFullMarketAStockList({
+      pageSize: 500,
+      retries: SNAPSHOT_REQUEST_RETRIES,
+      timeoutMs: options.timeoutMs ?? 10000,
+      baostockTimeoutMs: options.baostockTimeoutMs ?? 25000,
+      deadlineAt
+    })
+  } catch (error) {
+    const fallbackItems = getFullMarketStockListFallbackItems(cachedItems || [])
+    if (fallbackItems.length) {
+      if (typeof console !== 'undefined') {
+        console.warn('[full-history] stock list refresh failed, using cached list', error.message || error)
+      }
+      return fallbackItems.map(item => ({
+        ...item,
+        failedCount: Number(item.failedCount) || 0,
+        message: item.message || '使用缓存清单'
+      }))
+    }
+    throw new Error(`暂时无法加载全市场股票清单：${historyDisplayError(error)}`)
+  }
+
+  const items = stockListItemsToHistoryItems(result.stocks)
   if (!items.length) throw new Error('全市场股票列表为空，无法开始历史数据同步')
-  writeFullMarketStockList(items, spot?.endpoint || 'eastmoney_clist')
+  writeFullMarketStockList(result.stocks, result.source || 'eastmoney_clist_stock_list')
   return items.map(item => ({
     ...item,
     failedCount: Number(item.failedCount) || 0,
@@ -2032,42 +3010,87 @@ async function loadFullMarketHistoryItemsForDaily(options = {}) {
   }))
 }
 
+// Rebuild the all-market stock list from the latest Baostock result, falling back to Eastmoney.
 async function refreshFullMarketStockListFromSnapshot(options = {}) {
   if (isFullHistoryActive()) throw new Error('全市场历史任务运行中，请先停止或等待完成后再刷新股票清单')
   ensureFullHistoryDir()
 
-  const previousItems = readFullMarketStockList() || []
-  const spot = await fetchEastmoneyClistSpot({
-    codes: '',
-    pageSize: 500,
-    concurrency: 2
-  })
-  const items = extractFullHistoryItemsFromSpot(spot)
-  if (!items.length) throw new Error('当前日期股票快照为空，无法生成全市场股票清单')
+  const startedAt = Date.now()
+  const maxDurationMs = normalizeTimeoutMs(options.maxDurationMs ?? SNAPSHOT_REFRESH_MAX_MS, SNAPSHOT_REFRESH_MAX_MS)
+  const deadlineAt = startedAt + maxDurationMs
+  const retries = Math.max(
+    0,
+    Math.trunc(Number.isFinite(Number(options.retries)) ? Number(options.retries) : SNAPSHOT_REQUEST_RETRIES)
+  )
+  const timeoutMs = normalizeTimeoutMs(options.timeoutMs ?? 10000, 10000)
+  const previousStockCount = fs.existsSync(FULL_HISTORY_STOCK_LIST_FILE)
+    ? (readFullMarketStockList() || []).length
+    : 0
 
-  const shouldRewrite = !previousItems.length || previousItems.length !== items.length || Boolean(options.force)
-  if (shouldRewrite) {
-    writeFullMarketStockList(items, spot?.endpoint || 'eastmoney_clist_snapshot')
+  try {
+    fs.rmSync(FULL_HISTORY_STOCK_LIST_FILE, { force: true })
+  } catch (error) {
+    throw new Error(`清除旧股票清单失败：${error.message || error}`)
   }
 
-  const activeItems = shouldRewrite ? items : previousItems
-  fullHistoryJob = createFullHistoryJob({
-    ...fullHistoryJob,
-    status: 'ready',
-    stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
-    dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
-    dailyDir: FULL_HISTORY_DAILY_CACHE_DIR,
-    message: shouldRewrite
-      ? `已根据当前快照生成全市场股票清单：${items.length} 只`
-      : `当前快照 ${items.length} 只，与本地清单数量一致，继续使用现有清单`
-  }, activeItems)
+  try {
+    const result = await fetchFullMarketAStockList({
+      pageSize: 500,
+      retries,
+      timeoutMs,
+      baostockTimeoutMs: options.baostockTimeoutMs ?? 25000,
+      deadlineAt
+    })
+    const items = stockListItemsToHistoryItems(result.stocks)
+    if (!items.length) throw new Error('最新股票清单为空，未写入本地清单')
 
-  return {
-    ...buildFullHistorySnapshot(fullHistoryJob),
-    snapshotStockCount: items.length,
-    previousStockCount: previousItems.length,
-    stockListUpdated: shouldRewrite,
-    stockListFile: FULL_HISTORY_STOCK_LIST_FILE
+    writeFullMarketStockList(result.stocks, result.source || 'eastmoney_clist_stock_list')
+    const sourceLabel = result.source === 'baostock' ? 'Baostock' : '东方财富'
+    fullHistoryJob = createFullHistoryJob({
+      ...fullHistoryJob,
+      status: 'ready',
+      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+      dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
+      dailyDir: FULL_HISTORY_DAILY_CACHE_DIR,
+      message: `已清除旧清单并通过 ${sourceLabel} 生成全市场股票清单：${items.length} 只`
+    }, items)
+
+    return {
+      ...buildFullHistorySnapshot(fullHistoryJob),
+      snapshotStockCount: items.length,
+      previousStockCount,
+      stockListUpdated: true,
+      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+      stockListSource: result.source,
+      stockListEndpoint: result.endpoint,
+      refreshFailed: false,
+      fallbackUsed: false,
+      refreshDurationMs: Date.now() - startedAt,
+      maxDurationMs
+    }
+  } catch (error) {
+    const displayError = historyDisplayError(error)
+    fullHistoryJob = createFullHistoryJob({
+      status: 'failed',
+      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+      dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
+      dailyDir: FULL_HISTORY_DAILY_CACHE_DIR,
+      message: `刷新快照清单失败，旧清单已清除：${displayError}`,
+      errors: [displayError]
+    }, [])
+
+    return {
+      ...buildFullHistorySnapshot(fullHistoryJob),
+      snapshotStockCount: 0,
+      previousStockCount,
+      stockListUpdated: false,
+      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+      refreshFailed: true,
+      fallbackUsed: false,
+      error: displayError,
+      refreshDurationMs: Date.now() - startedAt,
+      maxDurationMs
+    }
   }
 }
 
@@ -2101,13 +3124,6 @@ function listFullHistoryWorkdays(startDate, endDate) {
 
 function getFullHistoryDailyFile(date) {
   return path.join(FULL_HISTORY_DAILY_CACHE_DIR, `all-market-history-${date}.json`)
-}
-
-function parseFullHistorySelectedCodes(value) {
-  if (Array.isArray(value)) {
-    return value.map(normalizeCacheCode).filter(Boolean)
-  }
-  return String(value || '').split(',').map(item => normalizeCacheCode(item.trim())).filter(Boolean)
 }
 
 function readFullHistoryDateIndex() {
@@ -2157,6 +3173,7 @@ function updateFullHistoryDateIndex(date, dailyPayload) {
     selectedCount: Number(dailyPayload.selectedCount) || 0,
     fetched: dailyPayload.fetched,
     failed: dailyPayload.failed,
+    failedTaskCount: Array.isArray(dailyPayload.failedTasks) ? dailyPayload.failedTasks.length : 0,
     updatedAt: dailyPayload.generatedAt
   }
   return writeFullHistoryDateIndex(index)
@@ -2176,17 +3193,22 @@ function fullHistoryRowData(row, date) {
   }
 }
 
-function markFullHistoryItemDay(item, date, ok, totalDays, message = '') {
+function markFullHistoryItemDay(item, date, ok, totalDays, message = '', skipped = false) {
   item.updatedAt = new Date().toISOString()
   if (ok) {
     item.rowCount = (Number(item.rowCount) || 0) + 1
     item.status = 'done'
+  } else if (skipped) {
+    // 请求成功但当日没有K线（停牌/未上市/新股）：记为跳过，不算失败。
+    item.skippedCount = (Number(item.skippedCount) || 0) + 1
+    if (!item.rowCount && item.status !== 'failed') item.status = 'skipped'
   } else {
     item.failedCount = (Number(item.failedCount) || 0) + 1
     if (!item.rowCount) item.status = 'failed'
   }
   const failed = Number(item.failedCount) || 0
-  item.message = message || `已处理 ${Number(item.rowCount) || 0}/${totalDays} 天${failed ? `，失败 ${failed} 天` : ''}`
+  const skippedCount = Number(item.skippedCount) || 0
+  item.message = message || `已处理 ${Number(item.rowCount) || 0}/${totalDays} 天${skippedCount ? `，跳过 ${skippedCount} 天` : ''}${failed ? `，失败 ${failed} 天` : ''}`
 }
 
 function updateFullHistoryDailyFiles(job, dayEntry) {
@@ -2196,6 +3218,7 @@ function updateFullHistoryDailyFiles(job, dayEntry) {
     filePath: dayEntry.filePath,
     fetched: Number(dayEntry.fetched) || 0,
     failed: Number(dayEntry.failed) || 0,
+    failedTaskCount: Array.isArray(dayEntry.failedTasks) ? dayEntry.failedTasks.length : 0,
     status: dayEntry.status,
     updatedAt: dayEntry.finishedAt || dayEntry.updatedAt || new Date().toISOString()
   }
@@ -2207,16 +3230,99 @@ function updateFullHistoryDailyFiles(job, dayEntry) {
   }
 }
 
+function getFullHistoryItemsForDate(job, date) {
+  const codes = job?.retryTaskMap?.[date]
+  if (!Array.isArray(codes) || !codes.length) return job.items
+  const codeSet = new Set(codes.map(normalizeCacheCode).filter(Boolean))
+  return job.items.filter(item => codeSet.has(item.code))
+}
+
+function getFullHistoryDatesForItem(job, item) {
+  const dates = Array.isArray(job?.dates) ? job.dates : []
+  if (!job?.retryTaskMap) return dates
+  const code = normalizeCacheCode(item?.code || '')
+  return dates.filter(dayEntry => {
+    const codes = job.retryTaskMap?.[dayEntry.date]
+    return Array.isArray(codes) && codes.map(normalizeCacheCode).includes(code)
+  })
+}
+
+function writeFullHistoryDayPayload(job, dayEntry, recordsByCode, dayItems) {
+  const date = dayEntry.date
+  const filePath = dayEntry.filePath || getFullHistoryDailyFile(date)
+  const fileName = dayEntry.fileName || path.basename(filePath)
+  const generatedAt = new Date().toISOString()
+  const fallbackStocks = dayItems.map(item => recordsByCode.get(item.code) || {
+    code: item.code,
+    name: item.name || item.code,
+    status: 'failed',
+    data: null,
+    error: '未处理',
+    source: 'eastmoney'
+  })
+  const existingDaily = job.selectedOnly ? readJsonFile(filePath) : null
+  let stocks = fallbackStocks
+  if (job.selectedOnly && Array.isArray(existingDaily?.stocks) && existingDaily.stocks.length) {
+    const existingCodes = new Set(existingDaily.stocks.map(item => normalizeCacheCode(item.code)))
+    const mergedByCode = new Map(existingDaily.stocks.map(item => [normalizeCacheCode(item.code), item]))
+    fallbackStocks.forEach(item => mergedByCode.set(item.code, item))
+    stocks = [
+      ...existingDaily.stocks.map(item => mergedByCode.get(normalizeCacheCode(item.code))).filter(Boolean),
+      ...fallbackStocks.filter(item => !existingCodes.has(normalizeCacheCode(item.code)))
+    ]
+    const seen = new Set()
+    stocks = stocks.filter(item => {
+      const code = normalizeCacheCode(item.code)
+      if (!code || seen.has(code)) return false
+      seen.add(code)
+      return true
+    })
+  }
+
+  const status = dayEntry.failed > 0 ? (dayEntry.fetched > 0 ? 'partial' : 'failed') : 'done'
+  const payload = {
+    schemaVersion: FULL_HISTORY_DAILY_CACHE_VERSION,
+    type: 'all_market_daily_history',
+    date,
+    adjust: job.adjust,
+    status,
+    generatedAt,
+    stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+    dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
+    fileName,
+    filePath,
+    stockCount: stocks.length,
+    selectedOnly: Boolean(job.selectedOnly),
+    selectedCount: job.items.length,
+    fetched: dayEntry.fetched,
+    failed: dayEntry.failed,
+    skipped: Number(dayEntry.skipped) || 0,
+    failedTasks: Array.isArray(dayEntry.failedTasks) ? dayEntry.failedTasks : [],
+    stocks
+  }
+
+  atomicWriteJson(filePath, payload)
+  updateFullHistoryDateIndex(date, payload)
+  dayEntry.status = status
+  dayEntry.message = `${date} 已写入 ${fileName}`
+  dayEntry.finishedAt = generatedAt
+  dayEntry.updatedAt = generatedAt
+  updateFullHistoryDailyFiles(job, dayEntry)
+  return { cancelled: false, payload }
+}
+
 async function fetchFullHistoryDay(job, dayEntry) {
   const date = dayEntry.date
   const filePath = getFullHistoryDailyFile(date)
   const fileName = path.basename(filePath)
   const recordsByCode = new Map()
+  const dayItems = getFullHistoryItemsForDate(job, date)
   const totalDays = job.dates.length || 1
   const startedAt = new Date().toISOString()
 
   dayEntry.status = 'running'
-  dayEntry.stockCount = job.items.length
+  dayEntry.stockCount = dayItems.length
+  dayEntry.failedTasks = []
   dayEntry.fileName = fileName
   dayEntry.filePath = filePath
   dayEntry.startedAt = startedAt
@@ -2224,12 +3330,12 @@ async function fetchFullHistoryDay(job, dayEntry) {
   dayEntry.message = `正在获取 ${date}`
   job.currentDate = date
 
-  for (let index = 0; index < job.items.length; index += FULL_HISTORY_DAILY_BATCH_SIZE) {
+  for (let index = 0; index < dayItems.length; index += FULL_HISTORY_DAILY_BATCH_SIZE) {
     if (job.cancelRequested) return { cancelled: true }
 
-    const batch = job.items.slice(index, index + FULL_HISTORY_DAILY_BATCH_SIZE)
+    const batch = dayItems.slice(index, index + FULL_HISTORY_DAILY_BATCH_SIZE)
     job.status = 'running'
-    job.currentCode = `${Math.min(index + batch.length, job.items.length)}/${job.items.length}`
+    job.currentCode = `${Math.min(index + batch.length, dayItems.length)}/${dayItems.length}`
     job.currentName = date
     job.message = `正在获取 ${date}：${job.currentCode}`
     batch.forEach(item => {
@@ -2241,18 +3347,30 @@ async function fetchFullHistoryDay(job, dayEntry) {
 
     let tables = []
     let errors = []
+    let failedTasks = []
     try {
       const history = await fetchEastmoneyHistoryBatch({
         codes: batch.map(item => item.code).join(','),
         startDate: date,
         endDate: date,
         adjust: job.adjust,
-        concurrency: FULL_HISTORY_DAILY_CONCURRENCY
+        concurrency: job.concurrency || FULL_HISTORY_DAILY_CONCURRENCY
       })
       tables = Array.isArray(history.payload?.tables) ? history.payload.tables : []
       errors = Array.isArray(history.payload?.errors) ? history.payload.errors : []
+      failedTasks = Array.isArray(history.payload?.failedTasks) ? history.payload.failedTasks : []
     } catch (error) {
       errors = batch.map(item => ({ code: item.code, message: error.message || '获取失败' }))
+      failedTasks = batch.map(item => createFailedTask({
+        code: item.code,
+        name: item.name || item.code,
+        error,
+        source: 'eastmoney_history_daily',
+        date,
+        startDate: date,
+        endDate: date,
+        adjust: job.adjust
+      }))
       addFullHistoryError(job, `${date}: ${error.message || '批次获取失败'}`)
     }
 
@@ -2262,6 +3380,7 @@ async function fetchFullHistoryDay(job, dayEntry) {
       if (code) tableByCode.set(code, table)
     })
     const errorByCode = new Map(errors.map(item => [normalizeCacheCode(item.code || ''), item.message || '获取失败']))
+    const failedTaskByCode = new Map(failedTasks.map(item => [normalizeCacheCode(item.code || ''), item]))
 
     batch.forEach(item => {
       const table = tableByCode.get(item.code)
@@ -2281,12 +3400,25 @@ async function fetchFullHistoryDay(job, dayEntry) {
         markFullHistoryItemDay(item, date, true, totalDays)
       } else {
         const message = errorByCode.get(item.code) || '未返回当日历史数据'
+        const failedTask = failedTaskByCode.get(item.code) || createFailedTask({
+          code: item.code,
+          name: item.name || item.code,
+          error: new Error(message),
+          source: 'eastmoney_history_daily',
+          date,
+          startDate: date,
+          endDate: date,
+          adjust: job.adjust
+        })
+        addFullHistoryFailedTask(job, dayEntry, failedTask)
         recordsByCode.set(item.code, {
           code: item.code,
           name: item.name || item.code,
           status: 'failed',
           data: null,
           error: message,
+          url: failedTask.url,
+          failedAt: failedTask.failedAt,
           source: 'eastmoney'
         })
         dayEntry.failed += 1
@@ -2301,13 +3433,13 @@ async function fetchFullHistoryDay(job, dayEntry) {
     if (errors.length) addFullHistoryError(job, `${date}: ${errors[0].code || 'batch'} ${errors[0].message || '获取失败'}`)
     writeFullHistoryMeta(job)
 
-    if (index + FULL_HISTORY_DAILY_BATCH_SIZE < job.items.length && !job.cancelRequested) {
+    if (index + FULL_HISTORY_DAILY_BATCH_SIZE < dayItems.length && !job.cancelRequested) {
       await waitFullHistoryDelay(job)
     }
   }
 
   const generatedAt = new Date().toISOString()
-  const fallbackStocks = job.items.map(item => recordsByCode.get(item.code) || {
+  const fallbackStocks = dayItems.map(item => recordsByCode.get(item.code) || {
     code: item.code,
     name: item.name || item.code,
     status: 'failed',
@@ -2350,6 +3482,7 @@ async function fetchFullHistoryDay(job, dayEntry) {
     selectedCount: job.items.length,
     fetched: dayEntry.fetched,
     failed: dayEntry.failed,
+    failedTasks: Array.isArray(dayEntry.failedTasks) ? dayEntry.failedTasks : [],
     stocks
   }
 
@@ -2374,6 +3507,195 @@ async function waitFullHistoryDelay(job) {
   }
 
   job.nextRequestAt = null
+}
+
+function prepareFullHistoryDayEntries(job) {
+  const now = new Date().toISOString()
+  job.dates.forEach(dayEntry => {
+    dayEntry.status = 'running'
+    dayEntry.stockCount = getFullHistoryItemsForDate(job, dayEntry.date).length
+    dayEntry.fileName = path.basename(getFullHistoryDailyFile(dayEntry.date))
+    dayEntry.filePath = getFullHistoryDailyFile(dayEntry.date)
+    dayEntry.startedAt = dayEntry.startedAt || now
+    dayEntry.updatedAt = now
+    dayEntry.failedTasks = []
+    dayEntry.message = `正在获取 ${dayEntry.date}`
+  })
+}
+
+async function runFullMarketHistorySyncByStockRange(job) {
+  try {
+    ensureFullHistoryDir()
+    writeFullHistoryDateIndex(readFullHistoryDateIndex())
+    prepareFullHistoryDayEntries(job)
+    writeFullHistoryMeta(job)
+
+    const recordsByDate = new Map(job.dates.map(dayEntry => [dayEntry.date, new Map()]))
+    const progress = createRequestProgress(job.items.length, 'full-history-stock-range')
+    const totalStocks = job.items.length || 1
+    const totalDays = job.dates.length || 1
+
+    await runRequestQueue(job.items, async (item, index) => {
+      const itemDates = getFullHistoryDatesForItem(job, item)
+      if (!itemDates.length || job.cancelRequested) return
+
+      item.status = 'running'
+      item.message = '获取中'
+      item.updatedAt = new Date().toISOString()
+      job.status = 'running'
+      job.currentCode = `${Math.min(index + 1, totalStocks)}/${totalStocks}`
+      job.currentName = item.name || item.code
+      job.message = `正在获取区间K线 ${job.currentCode} ${item.code} ${item.name || ''}`.trim()
+
+      try {
+        const table = await fetchEastmoneyHistoryTable(item.code, {
+          startDate: itemDates[0]?.date || job.startDate,
+          endDate: itemDates[itemDates.length - 1]?.date || job.endDate,
+          adjust: job.adjust,
+          retries: EASTMONEY_REQUEST_RETRIES,
+          timeoutMs: EASTMONEY_REQUEST_TIMEOUT_MS,
+          logRetries: true,
+          onRetry: info => {
+            progress.retries += 1
+            if (typeof console !== 'undefined') {
+              console.info(`[full-history] retry ${item.code} ${info.attempt}/${info.retries}`)
+            }
+          }
+        })
+        const rowsByDate = new Map(rowsFromTable(table)
+          .filter(row => row.time)
+          .map(row => [String(row.time || '').slice(0, 10), row]))
+        let rowCount = 0
+
+        itemDates.forEach(dayEntry => {
+          const date = dayEntry.date
+          const row = rowsByDate.get(date)
+          const recordsByCode = recordsByDate.get(date)
+          if (row) {
+            recordsByCode.set(item.code, {
+              code: item.code,
+              name: item.name || item.code,
+              status: 'done',
+              data: fullHistoryRowData(row, date),
+              source: 'eastmoney'
+            })
+            dayEntry.fetched += 1
+            job.fetched += 1
+            rowCount += 1
+            markFullHistoryItemDay(item, date, true, totalDays)
+          } else {
+            // 区间请求已经成功返回，只是这一天没有K线：几乎都是停牌/未上市/新股，
+            // 属于正常缺口而非请求失败——记为跳过，不写入 failedTasks，也不计入 failed，避免补跑队列无限膨胀。
+            const message = '当日无交易数据（停牌/未上市）'
+            recordsByCode.set(item.code, {
+              code: item.code,
+              name: item.name || item.code,
+              status: 'skipped',
+              data: null,
+              reason: message,
+              source: 'eastmoney'
+            })
+            dayEntry.skipped = (Number(dayEntry.skipped) || 0) + 1
+            job.skipped = (Number(job.skipped) || 0) + 1
+            markFullHistoryItemDay(item, date, false, totalDays, '', true)
+          }
+        })
+
+        const skippedCount = Number(item.skippedCount) || 0
+        item.rowCount = rowCount
+        if (rowCount > 0) {
+          item.status = 'done'
+          item.message = `已获取 ${rowCount} 条${skippedCount ? `，跳过 ${skippedCount} 天` : ''}`
+        } else {
+          // 整段区间都没有数据：请求本身成功，判定为无数据而非失败。
+          item.status = 'skipped'
+          item.message = '区间内无交易数据（停牌/未上市）'
+        }
+        progress.success += 1
+      } catch (error) {
+        const message = historyDisplayError(error)
+        item.status = 'failed'
+        item.rowCount = 0
+        item.message = message
+        progress.failed += 1
+
+        itemDates.forEach(dayEntry => {
+          const date = dayEntry.date
+          const recordsByCode = recordsByDate.get(date)
+          const failedTask = createFailedTask({
+            code: item.code,
+            name: item.name || item.code,
+            error,
+            source: 'eastmoney_history_range',
+            date,
+            startDate: job.startDate,
+            endDate: job.endDate,
+            adjust: job.adjust
+          })
+          addFullHistoryFailedTask(job, dayEntry, failedTask)
+          recordsByCode.set(item.code, {
+            code: item.code,
+            name: item.name || item.code,
+            status: 'failed',
+            data: null,
+            error: message,
+            url: failedTask.url,
+            failedAt: failedTask.failedAt,
+            source: 'eastmoney'
+          })
+          dayEntry.failed += 1
+          job.failed += 1
+          markFullHistoryItemDay(item, date, false, totalDays, message)
+        })
+        addFullHistoryError(job, `${item.code}: ${message}`)
+      } finally {
+        item.updatedAt = new Date().toISOString()
+        itemDates.forEach(dayEntry => {
+          dayEntry.processed += 1
+          dayEntry.updatedAt = new Date().toISOString()
+        })
+        job.processed += itemDates.length
+        progress.completed += 1
+        logRequestProgress(progress)
+        if (progress.completed % 10 === 0 || progress.completed === progress.total) {
+          writeFullHistoryMeta(job)
+        }
+      }
+    }, {
+      concurrency: job.concurrency || FULL_HISTORY_DAILY_CONCURRENCY,
+      shouldStop: () => Boolean(job.cancelRequested)
+    })
+    logRequestProgress(progress, true)
+
+    for (const dayEntry of job.dates) {
+      writeFullHistoryDayPayload(
+        job,
+        dayEntry,
+        recordsByDate.get(dayEntry.date) || new Map(),
+        getFullHistoryItemsForDate(job, dayEntry.date)
+      )
+    }
+
+    if (job.cancelRequested) {
+      job.status = 'stopped'
+      job.message = '已停止全市场历史数据同步'
+    } else {
+      job.status = 'completed'
+      job.message = `全市场历史数据同步完成，股票 ${job.items.length} 只，日期 ${job.dates.length} 天，成功 ${job.fetched} 条，跳过 ${Number(job.skipped) || 0} 条，失败 ${job.failed} 条`
+    }
+    job.currentDate = ''
+    job.currentCode = ''
+    job.currentName = ''
+    job.nextRequestAt = null
+    job.finishedAt = new Date().toISOString()
+    writeFullHistoryMeta(job)
+  } catch (error) {
+    job.status = 'failed'
+    job.message = error.message || '全市场历史数据同步失败'
+    job.finishedAt = new Date().toISOString()
+    addFullHistoryError(job, job.message)
+    writeFullHistoryMeta(job)
+  }
 }
 
 async function runFullMarketHistorySync(job) {
@@ -2499,6 +3821,7 @@ async function prepareFullMarketHistoryList(options = {}) {
       startDate: normalizeFullHistoryDate(options.startDate) || fullHistoryJob.startDate,
       endDate: normalizeFullHistoryDate(options.endDate) || fullHistoryJob.endDate,
       delayMs: clampFullHistoryDelay(options.delayMs || fullHistoryJob.delayMs),
+      concurrency: clampStockRequestConcurrency(options.concurrency || fullHistoryJob.concurrency),
       adjust: String(options.adjust || fullHistoryJob.adjust || '1')
     }
     return buildFullHistorySnapshot()
@@ -2509,6 +3832,7 @@ async function prepareFullMarketHistoryList(options = {}) {
     startDate: normalizeFullHistoryDate(options.startDate),
     endDate: normalizeFullHistoryDate(options.endDate),
     delayMs: options.delayMs,
+    concurrency: options.concurrency,
     adjust: options.adjust,
     message: '正在加载全市场股票列表'
   })
@@ -2529,6 +3853,7 @@ async function prepareFullMarketHistoryList(options = {}) {
   return buildFullHistorySnapshot()
 }
 
+// 启动全市场历史K线同步：按工作日拆任务。
 async function startFullMarketHistorySync(options = {}) {
   if (isFullHistoryActive()) return buildFullHistorySnapshot()
 
@@ -2540,15 +3865,9 @@ async function startFullMarketHistorySync(options = {}) {
   const workdays = listFullHistoryWorkdays(startDate, endDate)
   if (!workdays.length) throw new Error('选择区间内没有工作日，请重新选择日期')
 
-  const selectedCodes = parseFullHistorySelectedCodes(options.codes)
-  const selectedCodeSet = new Set(selectedCodes)
-  const sourceItems = fullHistoryJob?.items?.length
+  const items = fullHistoryJob?.items?.length
     ? fullHistoryJob.items
     : await loadFullMarketHistoryItemsForDaily()
-  const items = selectedCodeSet.size
-    ? sourceItems.filter(item => selectedCodeSet.has(normalizeCacheCode(item.code)))
-    : sourceItems
-  if (selectedCodeSet.size && !items.length) throw new Error('未在历史数据列表中找到选中的股票，请先刷新列表后再试')
   const resetItems = items.map(item => ({
     ...item,
     status: 'pending',
@@ -2564,6 +3883,7 @@ async function startFullMarketHistorySync(options = {}) {
     startDate,
     endDate,
     delayMs: options.delayMs,
+    concurrency: options.concurrency,
     adjust: options.adjust,
     startedAt: new Date().toISOString(),
     outputFile: paths.outputFile,
@@ -2571,8 +3891,8 @@ async function startFullMarketHistorySync(options = {}) {
     stockListFile: paths.stockListFile,
     dateIndexFile: paths.dateIndexFile,
     metaFile: paths.metaFile,
-    selectedOnly: selectedCodeSet.size > 0,
-    selectedCodes: items.map(item => item.code),
+    selectedOnly: false,
+    selectedCodes: [],
     dates: workdays.map(date => ({
       date,
       status: 'pending',
@@ -2580,14 +3900,150 @@ async function startFullMarketHistorySync(options = {}) {
       processed: 0,
       fetched: 0,
       failed: 0,
+      skipped: 0,
+      failedTasks: [],
       fileName: path.basename(getFullHistoryDailyFile(date)),
       filePath: getFullHistoryDailyFile(date),
       message: '等待获取'
     })),
-    message: `${selectedCodeSet.size ? '开始获取选中股票' : '开始按工作日获取'} ${resetItems.length} 只，${workdays.length} 天`
+    message: `开始按工作日获取 ${resetItems.length} 只，${workdays.length} 天`
   }, resetItems)
 
-  fullHistoryJob.promise = runFullMarketHistorySyncByDate(fullHistoryJob)
+  fullHistoryJob.promise = runFullMarketHistorySyncByStockRange(fullHistoryJob)
+  return buildFullHistorySnapshot()
+}
+
+function normalizeFailedHistoryTask(task) {
+  const code = normalizeCacheCode(task?.code || task?.thscode || '')
+  const date = normalizeFullHistoryDate(task?.date || task?.time || task?.startDate || '')
+  if (!code || !date) return null
+  return {
+    ...task,
+    code,
+    date,
+    name: String(task?.name || task?.stockName || code).trim(),
+    errorMessage: errorMessage(task?.errorMessage || task?.message || task?.error || '获取失败'),
+    failedAt: task?.failedAt || new Date().toISOString()
+  }
+}
+
+function failedTasksFromDailyPayload(payload) {
+  const date = normalizeFullHistoryDate(payload?.date || '')
+  if (!date) return []
+  if (Array.isArray(payload?.failedTasks) && payload.failedTasks.length) {
+    return payload.failedTasks.map(task => normalizeFailedHistoryTask({ ...task, date })).filter(Boolean)
+  }
+  const stocks = Array.isArray(payload?.stocks) ? payload.stocks : []
+  return stocks
+    .filter(item => item?.status === 'failed')
+    .map(item => normalizeFailedHistoryTask({
+      code: item.code,
+      name: item.name || item.code,
+      date,
+      url: item.url || '',
+      errorMessage: item.error || item.message || '获取失败',
+      source: item.source || 'eastmoney_history_daily',
+      failedAt: item.failedAt || payload.generatedAt
+    }))
+    .filter(Boolean)
+}
+
+function readFullHistoryFailedTasksFromDailyFiles() {
+  const tasks = []
+  const dateIndex = readFullHistoryDateIndex()
+  const entries = Object.values(dateIndex?.dates || {})
+  entries.forEach(entry => {
+    const filePath = entry?.filePath || (entry?.date ? getFullHistoryDailyFile(entry.date) : '')
+    if (!filePath) return
+    const payload = readJsonFile(filePath)
+    tasks.push(...failedTasksFromDailyPayload(payload))
+  })
+
+  if (!tasks.length && fs.existsSync(FULL_HISTORY_DAILY_CACHE_DIR)) {
+    try {
+      fs.readdirSync(FULL_HISTORY_DAILY_CACHE_DIR)
+        .filter(fileName => fileName.endsWith('.json'))
+        .forEach(fileName => {
+          const payload = readJsonFile(path.join(FULL_HISTORY_DAILY_CACHE_DIR, fileName))
+          tasks.push(...failedTasksFromDailyPayload(payload))
+        })
+    } catch {}
+  }
+  return tasks
+}
+
+// 从日缓存或当前任务中提取失败记录，只补跑失败的股票/日期组合。
+async function retryFullMarketFailedTasks(options = {}) {
+  if (isFullHistoryActive()) return buildFullHistorySnapshot()
+
+  const inputTasks = Array.isArray(options.failedTasks) && options.failedTasks.length
+    ? options.failedTasks
+    : (Array.isArray(fullHistoryJob?.failedTasks) ? fullHistoryJob.failedTasks : [])
+  let failedTasks = inputTasks.map(normalizeFailedHistoryTask).filter(Boolean)
+  if (!failedTasks.length) {
+    failedTasks = readFullHistoryFailedTasksFromDailyFiles()
+  }
+  if (!failedTasks.length) throw new Error('没有可补跑的失败任务')
+
+  const taskMap = new Map()
+  const nameByCode = new Map()
+  failedTasks.forEach(task => {
+    if (!taskMap.has(task.date)) taskMap.set(task.date, new Set())
+    taskMap.get(task.date).add(task.code)
+    if (task.name) nameByCode.set(task.code, task.name)
+  })
+  const dates = Array.from(taskMap.keys()).sort()
+  const codes = Array.from(new Set(dates.flatMap(date => Array.from(taskMap.get(date))))).sort()
+  const cachedItems = fullHistoryJob?.items?.length ? fullHistoryJob.items : (readFullMarketStockList() || [])
+  const itemByCode = new Map(cachedItems.map(item => [normalizeCacheCode(item.code), item]))
+  const retryTaskMap = Object.fromEntries(dates.map(date => [date, Array.from(taskMap.get(date)).sort()]))
+  const resetItems = codes.map(code => ({
+    ...(itemByCode.get(code) || {}),
+    code,
+    name: nameByCode.get(code) || itemByCode.get(code)?.name || code,
+    status: 'pending',
+    rowCount: 0,
+    failedCount: 0,
+    message: '等待补跑',
+    updatedAt: null
+  }))
+  const startDate = dates[0]
+  const endDate = dates[dates.length - 1]
+  const paths = createFullHistoryOutputPaths(startDate, endDate)
+
+  fullHistoryJob = createFullHistoryJob({
+    status: 'running',
+    startDate,
+    endDate,
+    delayMs: options.delayMs,
+    concurrency: options.concurrency,
+    adjust: options.adjust || fullHistoryJob?.adjust || '1',
+    startedAt: new Date().toISOString(),
+    outputFile: paths.outputFile,
+    dailyDir: paths.dailyDir,
+    stockListFile: paths.stockListFile,
+    dateIndexFile: paths.dateIndexFile,
+    metaFile: paths.metaFile,
+    selectedOnly: true,
+    selectedCodes: resetItems.map(item => item.code),
+    retryTaskMap,
+    dates: dates.map(date => ({
+      date,
+      status: 'pending',
+      stockCount: retryTaskMap[date].length,
+      processed: 0,
+      fetched: 0,
+      failed: 0,
+      skipped: 0,
+      failedTasks: [],
+      fileName: path.basename(getFullHistoryDailyFile(date)),
+      filePath: getFullHistoryDailyFile(date),
+      message: '等待补跑'
+    })),
+    message: `开始补跑失败任务 ${failedTasks.length} 条，股票 ${resetItems.length} 只，日期 ${dates.length} 天`
+  }, resetItems)
+
+  fullHistoryJob.promise = runFullMarketHistorySyncByStockRange(fullHistoryJob)
   return buildFullHistorySnapshot()
 }
 
@@ -2601,7 +4057,19 @@ function cancelFullMarketHistorySync() {
   return buildFullHistorySnapshot()
 }
 
+// 暴露给 React 的白名单桥接 API；前端只能通过这些函数访问 Node/Electron 能力。
 window.stockReviewBridge = {
+  openDesktopWindow(options = {}) {
+    const win = openDesktopWindow({
+      forceReload: Boolean(options.forceReload),
+      verify: options.verify !== false
+    })
+    return {
+      ok: Boolean(win),
+      url: lastDesktopWindowUrl,
+      reused: Boolean(win && win === stockReviewDesktopWindow)
+    }
+  },
   copyText(text) {
     clipboard.writeText(String(text || ''))
     return true
@@ -2663,6 +4131,9 @@ window.stockReviewBridge = {
   async fetchAkshareSpot(options) {
     return fetchAkshareSpot(options)
   },
+  async installBaostockPackage(options) {
+    return installBaostockPackage(options)
+  },
   async fetchFreeStableData(options) {
     return fetchFreeStableData(options)
   },
@@ -2674,6 +4145,9 @@ window.stockReviewBridge = {
   },
   async startFullMarketHistorySync(options) {
     return startFullMarketHistorySync(options)
+  },
+  async retryFullMarketFailedTasks(options) {
+    return retryFullMarketFailedTasks(options)
   },
   async cancelFullMarketHistorySync() {
     return cancelFullMarketHistorySync()
