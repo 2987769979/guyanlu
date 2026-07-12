@@ -5,6 +5,7 @@ import {
   Box,
   Button,
   Chip,
+  Collapse,
   CssBaseline,
   Dialog,
   DialogActions,
@@ -47,6 +48,8 @@ import BookmarkAddIcon from '@mui/icons-material/BookmarkAdd'
 import ContentCopyIcon from '@mui/icons-material/ContentCopy'
 import DashboardIcon from '@mui/icons-material/Dashboard'
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline'
+import ExpandLessIcon from '@mui/icons-material/ExpandLess'
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import ReceiptLongIcon from '@mui/icons-material/ReceiptLong'
 import SellOutlinedIcon from '@mui/icons-material/SellOutlined'
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined'
@@ -170,6 +173,13 @@ const EMPTY_HISTORY_SYNC_STATE = {
   concurrency: FULL_HISTORY_DEFAULT_CONCURRENCY,
   failedTaskCount: 0,
   stockListFile: '',
+  calculateStockListFile: '',
+  stockIndexFile: '',
+  historyExecutable: '',
+  historyCommand: '',
+  outputDir: '',
+  processId: null,
+  requiresCleanup: false,
   dateIndexFile: '',
   dailyDir: '',
   dailyFiles: [],
@@ -609,6 +619,7 @@ export default function App() {
   const [historySync, setHistorySync] = useState(EMPTY_HISTORY_SYNC_STATE)
   const [historySyncBusy, setHistorySyncBusy] = useState(false)
   const [historySyncAction, setHistorySyncAction] = useState(null)
+  const [historyCleanupRequest, setHistoryCleanupRequest] = useState(null)
   const [historySyncForm, setHistorySyncForm] = useState(() => ({
     startDate: initialAppState.dataConfig.startDate,
     endDate: initialAppState.dataConfig.endDate,
@@ -838,6 +849,11 @@ export default function App() {
   }, [dataConfig])
 
   useEffect(() => {
+    if (activePage !== 'historySync') return
+    refreshFullHistoryStatus({ silent: true })
+  }, [activePage])
+
+  useEffect(() => {
     if (!historySyncActive) return undefined
     let cancelled = false
     const poll = async () => {
@@ -861,7 +877,7 @@ export default function App() {
     try {
       const snapshot = await bridge.getFullMarketHistorySyncStatus()
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
-      if (!options.silent && snapshot?.message) setStatus(snapshot.message, snapshot.dateIndexFile || snapshot.outputFile || snapshot.message)
+      if (!options.silent && snapshot?.message) setStatus(snapshot.message, snapshot.stockIndexFile || snapshot.outputDir || snapshot.message)
       return snapshot
     } catch (error) {
       if (!options.silent) setStatus(error.message || '读取历史同步状态失败', errorDetail(error, '读取历史同步状态失败'))
@@ -901,7 +917,7 @@ export default function App() {
       setHistorySyncAction({
         type: 'snapshot',
         label: '正在刷新快照清单',
-        detail: '正在优先使用 Baostock 重建本地股票清单；失败后切换东方财富。',
+        detail: historySync.snapshotCommand || 'fetch_all_a_stocks_v2.exe --output all-market-stocks.json --source baostock',
         startedAt: Date.now()
       })
       setHistorySync(current => ({
@@ -910,7 +926,7 @@ export default function App() {
       }))
       setStatus(
         '正在刷新快照清单...',
-        '正在优先使用 Baostock 获取清单，失败后切换东方财富 clist'
+        historySync.snapshotExecutable || historySync.snapshotCommand || '正在调用固定目录中的清单程序'
       )
       const snapshot = await bridge.refreshFullMarketStockListFromSnapshot()
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
@@ -976,12 +992,12 @@ export default function App() {
     try {
       setHistorySyncBusy(true)
       const snapshot = await bridge.startFullMarketHistorySync({
-        ...historySyncForm,
-        delayMs: Number(historySyncForm.delayMs) || FULL_HISTORY_DEFAULT_DELAY_MS,
-        concurrency: Number(historySyncForm.concurrency) || FULL_HISTORY_DEFAULT_CONCURRENCY
+        startDate: historySyncForm.startDate,
+        endDate: historySyncForm.endDate
       })
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
-      setStatus(snapshot?.message || '全市场历史数据同步已开始', snapshot?.dateIndexFile || snapshot?.outputFile || '')
+      setHistoryCleanupRequest(snapshot?.requiresCleanup ? snapshot : null)
+      setStatus(snapshot?.message || '全市场历史数据同步已开始', snapshot?.stockIndexFile || snapshot?.outputDir || snapshot?.historyExecutable || '')
     } catch (error) {
       setStatus(error.message || '启动全市场历史数据同步失败', errorDetail(error, '启动全市场历史数据同步失败'))
     } finally {
@@ -989,23 +1005,20 @@ export default function App() {
     }
   }
 
-  async function handleRetryFailedHistoryTasks() {
+  async function handleConfirmHistoryCleanup() {
     const bridge = window.stockReviewBridge
-    if (!bridge?.retryFullMarketFailedTasks) {
-      setStatus('当前环境不支持补跑失败任务，请在 uTools/Electron 中运行')
+    if (!bridge?.cleanupFullMarketHistoryExecutableData) {
+      setStatus('当前环境不支持清理历史数据，请在 uTools/Electron 中运行')
       return
     }
     try {
       setHistorySyncBusy(true)
-      const snapshot = await bridge.retryFullMarketFailedTasks({
-        ...historySyncForm,
-        delayMs: Number(historySyncForm.delayMs) || FULL_HISTORY_DEFAULT_DELAY_MS,
-        concurrency: Number(historySyncForm.concurrency) || FULL_HISTORY_DEFAULT_CONCURRENCY
-      })
+      const snapshot = await bridge.cleanupFullMarketHistoryExecutableData()
+      setHistoryCleanupRequest(null)
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
-      setStatus(snapshot?.message || '已开始补跑失败任务', snapshot?.dateIndexFile || snapshot?.outputFile || '')
+      setStatus(snapshot?.message || '旧历史数据已清理', (snapshot?.removedPaths || []).join('\n'))
     } catch (error) {
-      setStatus(error.message || '补跑失败任务启动失败', errorDetail(error, '补跑失败任务启动失败'))
+      setStatus(error.message || '清理旧历史数据失败', errorDetail(error, '清理旧历史数据失败'))
     } finally {
       setHistorySyncBusy(false)
     }
@@ -1594,11 +1607,12 @@ export default function App() {
               action={historySyncAction}
               onPrepareList={() => handlePrepareFullHistoryList(true)}
               onRefreshStockList={handleRefreshFullMarketStockSnapshot}
-              onInstallBaostock={handleInstallBaostockPackage}
               onStart={handleStartFullHistorySync}
-              onRetryFailed={handleRetryFailedHistoryTasks}
               onStop={handleStopFullHistorySync}
               onRefresh={() => refreshFullHistoryStatus()}
+              cleanupRequest={historyCleanupRequest}
+              onConfirmCleanup={handleConfirmHistoryCleanup}
+              onCancelCleanup={() => setHistoryCleanupRequest(null)}
             />
           )}
           {activePage === 'backtest' && (
@@ -2351,7 +2365,7 @@ function StrategyPage({
   )
 }
 
-// 历史同步页负责展示后台全市场K线任务，包括准备清单、启动、停止和失败补跑。
+// 历史同步页负责展示固定目录中的清单、历史程序状态以及启动/停止操作。
 function HistorySyncPage({
   state,
   form,
@@ -2361,13 +2375,32 @@ function HistorySyncPage({
   action,
   onPrepareList,
   onRefreshStockList,
-  onInstallBaostock,
   onStart,
-  onRetryFailed,
   onStop,
-  onRefresh
+  onRefresh,
+  cleanupRequest,
+  onConfirmCleanup,
+  onCancelCleanup
 }) {
   const rows = Array.isArray(state.items) ? state.items : []
+  const fixedPaths = useMemo(() => {
+    try {
+      return window.stockReviewBridge?.getFullMarketHistoryPaths?.() || {}
+    } catch {
+      return {}
+    }
+  }, [])
+  const dataDir = state.dataDir || fixedPaths.dataDir || ''
+  const stockListFile = state.stockListFile || fixedPaths.stockListFile || ''
+  const snapshotExecutable = state.snapshotExecutable || fixedPaths.snapshotExecutable || ''
+  const snapshotCommand = state.snapshotCommand || fixedPaths.snapshotCommand || 'fetch_all_a_stocks_v2.exe --output all-market-stocks.json --source baostock'
+  const historyExecutable = state.historyExecutable || fixedPaths.historyExecutable || ''
+  const calculateStockListFile = state.calculateStockListFile || fixedPaths.calculateStockListFile || ''
+  const historyOutputDir = state.outputDir || fixedPaths.outputDir || ''
+  const stockIndexFile = state.stockIndexFile || fixedPaths.stockIndexFile || ''
+  const historyCommand = isActive && state.historyCommand
+    ? state.historyCommand
+    : `fetch_a_stock_history_by_stock.exe --start ${form.startDate || '<开始日期>'} --end ${form.endDate || '<结束日期>'} --stock-list-file "all-market-stocks-Calculate.json" --output-dir "all-market-history-by-stock" --source baostock --resume`
   const progress = Math.max(0, Math.min(100, Number(state.progress) || 0))
   const setFormValue = (key, value) => onFormChange(current => ({ ...current, [key]: value }))
   const statusMeta = historyJobStatusMeta(state.status)
@@ -2375,10 +2408,11 @@ function HistorySyncPage({
   const [statusFilter, setStatusFilter] = useState('all')
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(20)
+  const [jumpPage, setJumpPage] = useState('1')
+  const [detailsExpanded, setDetailsExpanded] = useState(true)
   const [actionClock, setActionClock] = useState(Date.now())
   const actionElapsedMs = action?.startedAt ? Math.max(0, actionClock - action.startedAt) : 0
   const isSnapshotRefreshing = action?.type === 'snapshot'
-  const isBaostockInstalling = action?.type === 'installBaostock'
 
   const filteredRows = useMemo(() => {
     const keyword = query.trim().toLowerCase()
@@ -2392,10 +2426,14 @@ function HistorySyncPage({
     const start = page * rowsPerPage
     return filteredRows.slice(start, start + rowsPerPage)
   }, [filteredRows, page, rowsPerPage])
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / rowsPerPage))
   useEffect(() => {
     const maxPage = Math.max(0, Math.ceil(filteredRows.length / rowsPerPage) - 1)
     if (page > maxPage) setPage(maxPage)
   }, [filteredRows.length, rowsPerPage, page])
+  useEffect(() => {
+    setJumpPage(String(page + 1))
+  }, [page])
 
   useEffect(() => {
     if (!action) return undefined
@@ -2407,10 +2445,23 @@ function HistorySyncPage({
   const handleQueryChange = event => {
     setQuery(event.target.value)
     setPage(0)
+    setJumpPage('1')
   }
   const handleStatusFilterChange = event => {
     setStatusFilter(event.target.value)
     setPage(0)
+    setJumpPage('1')
+  }
+  const handlePageChange = (event, nextPage) => setPage(nextPage)
+  const handleRowsPerPageChange = event => {
+    setRowsPerPage(Number(event.target.value))
+    setPage(0)
+    setJumpPage('1')
+  }
+  const handleJumpPage = () => {
+    const nextPage = Math.min(totalPages, Math.max(1, Number.parseInt(jumpPage, 10) || 1))
+    setPage(nextPage - 1)
+    setJumpPage(String(nextPage))
   }
 
   return (
@@ -2421,7 +2472,7 @@ function HistorySyncPage({
         action={(
           <Stack direction='row' spacing={1} flexWrap='wrap' useFlexGap>
             <Button startIcon={<SyncIcon />} variant='outlined' onClick={onPrepareList} disabled={isBusy || isActive}>
-              刷新列表
+              从文件刷新列表
             </Button>
             <Button
               startIcon={isSnapshotRefreshing ? <SyncIcon className='spin-icon' /> : <TableChartIcon />}
@@ -2431,19 +2482,8 @@ function HistorySyncPage({
             >
               {isSnapshotRefreshing ? `刷新中 ${formatElapsed(actionElapsedMs)}` : '刷新快照清单'}
             </Button>
-            <Button
-              startIcon={isBaostockInstalling ? <SyncIcon className='spin-icon' /> : <AddCircleOutlineIcon />}
-              variant='outlined'
-              onClick={onInstallBaostock}
-              disabled={isBusy || isActive}
-            >
-              {isBaostockInstalling ? `安装中 ${formatElapsed(actionElapsedMs)}` : '安装 Baostock'}
-            </Button>
             <Button startIcon={<PlayArrowIcon />} variant='contained' onClick={() => onStart()} disabled={isBusy || isActive}>
               开始获取
-            </Button>
-            <Button startIcon={<RestartAltIcon />} color='warning' variant='outlined' onClick={onRetryFailed} disabled={isBusy || isActive || !state.failedTaskCount}>
-              重跑失败{state.failedTaskCount ? `(${state.failedTaskCount})` : ''}
             </Button>
             <Button startIcon={<RestartAltIcon />} color='warning' variant='outlined' onClick={onStop} disabled={!isActive}>
               停止
@@ -2475,88 +2515,80 @@ function HistorySyncPage({
             InputLabelProps={{ shrink: true }}
             disabled={isActive}
           />
-          <TextField
-            size='small'
-            type='number'
-            label='单只延时(ms)'
-            value={form.delayMs}
-            onChange={event => setFormValue('delayMs', Number(event.target.value))}
-            inputProps={{ min: 500, max: 60000, step: 100 }}
-            disabled={isActive}
-          />
-          <TextField
-            size='small'
-            type='number'
-            label='请求并发'
-            value={form.concurrency || FULL_HISTORY_DEFAULT_CONCURRENCY}
-            onChange={event => setFormValue('concurrency', Number(event.target.value))}
-            inputProps={{ min: 3, max: 10, step: 1 }}
-            disabled={isActive}
-          />
-          <FormControl size='small'>
-            <InputLabel>复权</InputLabel>
-            <Select
-              label='复权'
-              value={form.adjust}
-              onChange={event => setFormValue('adjust', event.target.value)}
-              disabled={isActive}
-            >
-              <MenuItem value='0'>不复权</MenuItem>
-              <MenuItem value='1'>前复权</MenuItem>
-              <MenuItem value='2'>后复权</MenuItem>
-            </Select>
-          </FormControl>
         </Box>
-        <Stack spacing={1.1} mt={2}>
-          {action && (
-            <Alert severity='info' icon={<SyncIcon className='spin-icon' />}>
-              <Typography variant='body2' fontWeight={800}>
-                {action.label} · 已耗时 {formatElapsed(actionElapsedMs)}
-              </Typography>
-              {action.detail && (
-                <Typography variant='caption' color='text.secondary'>
-                  {action.detail}
+        <Box className='history-details-head'>
+          <Typography variant='subtitle2' fontWeight={800}>任务状态与文件位置</Typography>
+          <Button
+            size='small'
+            variant='text'
+            endIcon={detailsExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+            onClick={() => setDetailsExpanded(value => !value)}
+            aria-expanded={detailsExpanded}
+          >
+            {detailsExpanded ? '收起详情' : '展开详情'}
+          </Button>
+        </Box>
+        <Collapse in={detailsExpanded} timeout='auto'>
+          <Stack spacing={1.1} className='history-details-content'>
+            {action && (
+              <Alert severity='info' icon={<SyncIcon className='spin-icon' />}>
+                <Typography variant='body2' fontWeight={800}>
+                  {action.label} · 已耗时 {formatElapsed(actionElapsedMs)}
                 </Typography>
-              )}
-            </Alert>
-          )}
-          <Box className='panel-head'>
-            <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap>
-              <Chip size='small' label={statusMeta.label} color={statusMeta.color} variant='outlined' />
-              {state.currentCode && <Chip size='small' label={`${state.currentCode} ${state.currentName || ''}`} />}
-              {state.nextRequestAt && <Chip size='small' label={`下次请求 ${formatDateTime(state.nextRequestAt).slice(11)}`} variant='outlined' />}
-            </Stack>
-            <Typography variant='body2' fontWeight={800}>{progress}%</Typography>
-          </Box>
-          <LinearProgress variant='determinate' value={progress} />
-          <Typography variant='caption' color='text.secondary'>{state.message || '等待任务'}</Typography>
-          <Typography variant='caption' color='text.secondary' className='full-history-output'>
-            数据文件：{state.outputFile || '未生成'}
-          </Typography>
-          {state.dailyDir && (
+                {action.detail && (
+                  <Typography variant='caption' color='text.secondary'>
+                    {action.detail}
+                  </Typography>
+                )}
+              </Alert>
+            )}
+            <Box className='panel-head'>
+              <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap>
+                <Chip size='small' label={statusMeta.label} color={statusMeta.color} variant='outlined' />
+                {state.currentCode && <Chip size='small' label={`${state.currentCode} ${state.currentName || ''}`} />}
+                {state.nextRequestAt && <Chip size='small' label={`下次请求 ${formatDateTime(state.nextRequestAt).slice(11)}`} variant='outlined' />}
+              </Stack>
+              <Typography variant='body2' fontWeight={800}>{progress}%</Typography>
+            </Box>
+            <LinearProgress variant='determinate' value={progress} />
+            <Typography variant='caption' color='text.secondary'>{state.message || '等待任务'}</Typography>
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
-              每日缓存目录：{state.dailyDir}
+              固定数据目录：{dataDir || '正在读取系统固定地址...'}
             </Typography>
-          )}
-          {state.stockListFile && (
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
-              全市场股票清单：{state.stockListFile}
+              快照程序地址：{snapshotExecutable || '正在读取系统固定地址...'}
             </Typography>
-          )}
-          {state.dateIndexFile && (
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
-              日期缓存索引：{state.dateIndexFile}
+              快照清单地址：{stockListFile || '正在读取系统固定地址...'}
             </Typography>
-          )}
-          {state.metaFile && (
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
-              进度文件：{state.metaFile}
+              执行命令：{snapshotCommand}
             </Typography>
-          )}
-        </Stack>
+            <Typography variant='caption' color='text.secondary' className='full-history-output'>
+              历史程序地址：{historyExecutable || '正在读取系统固定地址...'}
+            </Typography>
+            <Typography variant='caption' color='text.secondary' className='full-history-output'>
+              计算清单地址：{calculateStockListFile || '正在读取系统固定地址...'}
+            </Typography>
+            <Typography variant='caption' color='text.secondary' className='full-history-output'>
+              历史输出目录：{historyOutputDir || '正在读取系统固定地址...'}
+            </Typography>
+            <Typography variant='caption' color='text.secondary' className='full-history-output'>
+              股票数据索引：{stockIndexFile || '正在读取系统固定地址...'}
+            </Typography>
+            <Typography variant='caption' color='text.secondary' className='full-history-output'>
+              历史执行命令：{historyCommand}
+            </Typography>
+            {state.processId && (
+              <Typography variant='caption' color='text.secondary' className='full-history-output'>
+                历史程序进程：PID {state.processId}
+              </Typography>
+            )}
+          </Stack>
+        </Collapse>
       </Paper>
 
-      <Box className='metric-grid'>
+      <Box className='metric-grid history-metrics'>
         <MetricCard label='股票总数' value={state.total || rows.length} sub='全市场列表' accent='blue' />
         <MetricCard label='已获取' value={state.fetched || 0} sub='写入本地文件' accent='green' />
         <MetricCard label='未获取' value={state.pending || 0} sub='等待队列' accent='cyan' />
@@ -2565,38 +2597,39 @@ function HistorySyncPage({
       </Box>
 
       <Paper className='panel' variant='outlined'>
-        <Box className='panel-head'>
-          <Typography variant='subtitle2' fontWeight={800}>获取历史数据的列表</Typography>
-          <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap>
+        <Box className='history-list-header'>
+          <Box className='panel-head'>
+            <Typography variant='subtitle2' fontWeight={800}>获取历史数据的列表</Typography>
             <Chip size='small' label={`${filteredRows.length}/${rows.length} 只`} variant='outlined' />
+          </Box>
+          <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap className='history-list-filters'>
+            <TextField
+              size='small'
+              label='股票名称/代码'
+              value={query}
+              onChange={handleQueryChange}
+              className='history-list-search'
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position='start'>
+                    <SearchIcon fontSize='small' />
+                  </InputAdornment>
+                )
+              }}
+            />
+            <FormControl size='small' className='history-status-filter'>
+              <InputLabel>状态</InputLabel>
+              <Select label='状态' value={statusFilter} onChange={handleStatusFilterChange}>
+                <MenuItem value='all'>全部状态</MenuItem>
+                <MenuItem value='pending'>未获取</MenuItem>
+                <MenuItem value='running'>获取中</MenuItem>
+                <MenuItem value='done'>已获取</MenuItem>
+                <MenuItem value='skipped'>无数据</MenuItem>
+                <MenuItem value='failed'>失败</MenuItem>
+              </Select>
+            </FormControl>
           </Stack>
         </Box>
-        <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap mb={1.5}>
-          <TextField
-            size='small'
-            label='股票名称/代码'
-            value={query}
-            onChange={handleQueryChange}
-            InputProps={{
-              startAdornment: (
-                <InputAdornment position='start'>
-                  <SearchIcon fontSize='small' />
-                </InputAdornment>
-              )
-            }}
-          />
-          <FormControl size='small' sx={{ minWidth: 128 }}>
-            <InputLabel>状态</InputLabel>
-            <Select label='状态' value={statusFilter} onChange={handleStatusFilterChange}>
-              <MenuItem value='all'>全部状态</MenuItem>
-              <MenuItem value='pending'>未获取</MenuItem>
-              <MenuItem value='running'>获取中</MenuItem>
-              <MenuItem value='done'>已获取</MenuItem>
-              <MenuItem value='skipped'>无数据</MenuItem>
-              <MenuItem value='failed'>失败</MenuItem>
-            </Select>
-          </FormControl>
-        </Stack>
         <TableContainer className='table-wrap full-history-table'>
           <Table size='small' stickyHeader>
             <TableHead>
@@ -2636,7 +2669,63 @@ function HistorySyncPage({
             </TableBody>
           </Table>
         </TableContainer>
+        <Stack direction={{ xs: 'column', sm: 'row' }} alignItems={{ xs: 'stretch', sm: 'center' }} justifyContent='space-between' spacing={1}>
+          <TablePagination
+            component='div'
+            count={filteredRows.length}
+            page={page}
+            rowsPerPage={rowsPerPage}
+            rowsPerPageOptions={[10, 20, 50, 100, 200]}
+            onPageChange={handlePageChange}
+            onRowsPerPageChange={handleRowsPerPageChange}
+            labelRowsPerPage='每页条数'
+            labelDisplayedRows={({ from, to, count }) => `第 ${page + 1}/${totalPages} 页（${from}-${to} / ${count}）`}
+            showFirstButton
+            showLastButton
+          />
+          <Stack direction='row' spacing={1} alignItems='center' sx={{ pr: { sm: 2 }, pb: { xs: 1, sm: 0 } }}>
+            <TextField
+              size='small'
+              type='number'
+              label='跳转页数'
+              value={jumpPage}
+              onChange={event => setJumpPage(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') handleJumpPage()
+              }}
+              inputProps={{ min: 1, max: totalPages, step: 1 }}
+              sx={{ width: 112 }}
+            />
+            <Button variant='outlined' onClick={handleJumpPage}>跳转</Button>
+            <Typography variant='body2' color='text.secondary' whiteSpace='nowrap'>
+              当前第 {page + 1} 页
+            </Typography>
+          </Stack>
+        </Stack>
       </Paper>
+      <Dialog open={Boolean(cleanupRequest)} onClose={isBusy ? undefined : onCancelCleanup} maxWidth='sm' fullWidth>
+        <DialogTitle>历史数据日期范围不一致</DialogTitle>
+        <DialogContent>
+          <Alert severity='warning' sx={{ mb: 2 }}>
+            {cleanupRequest?.cleanupReason || '已有历史数据与当前页面日期不一致，需要先清理旧数据。'}
+          </Alert>
+          <Typography variant='body2' color='text.secondary'>
+            确认后将删除历史输出目录、股票数据索引和计算清单；不会删除快照清单及两个可执行程序。本次操作只执行清理，不会自动重新开始获取。
+          </Typography>
+          <Typography variant='caption' color='text.secondary' className='full-history-output' sx={{ mt: 2 }}>
+            历史输出目录：{cleanupRequest?.outputDir || historyOutputDir}
+          </Typography>
+          <Typography variant='caption' color='text.secondary' className='full-history-output'>
+            股票数据索引：{cleanupRequest?.stockIndexFile || stockIndexFile}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={onCancelCleanup} disabled={isBusy}>取消</Button>
+          <Button color='error' variant='contained' onClick={onConfirmCleanup} disabled={isBusy}>
+            {isBusy ? '正在清理...' : '确认删除旧数据'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   )
 }
@@ -2649,6 +2738,7 @@ function historyJobStatusMeta(status) {
     running: { label: '获取中', color: 'warning' },
     stopping: { label: '停止中', color: 'warning' },
     stopped: { label: '已停止', color: 'default' },
+    cleanup_required: { label: '待清理旧数据', color: 'warning' },
     completed: { label: '已完成', color: 'success' },
     failed: { label: '失败', color: 'error' }
   }[status] || { label: status || '未知', color: 'default' }

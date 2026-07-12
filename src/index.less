@@ -259,9 +259,65 @@ code {
 
 .history-sync-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  grid-template-columns: repeat(2, minmax(160px, 1fr));
   gap: 10px;
   align-items: center;
+}
+
+.history-details-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #e5eaf2;
+}
+
+.history-details-content {
+  padding-top: 8px;
+}
+
+.metric-grid.history-metrics {
+  grid-template-columns: repeat(5, minmax(132px, 1fr));
+  gap: 8px;
+  overflow-x: auto;
+}
+
+.history-metrics .metric-card {
+  min-height: 82px;
+  padding: 10px 12px;
+}
+
+.history-metrics .MuiTypography-h5 {
+  font-size: 1.25rem;
+  line-height: 1.25;
+}
+
+.history-metrics .MuiTypography-caption {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.history-list-header {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.history-list-filters {
+  min-height: 40px;
+}
+
+.history-list-search {
+  width: min(260px, 100%);
+}
+
+.history-status-filter {
+  min-width: 140px !important;
 }
 
 .full-history-output {

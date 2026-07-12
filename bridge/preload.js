@@ -90,10 +90,24 @@ const FREE_HISTORY_DEFAULT_LIMIT = 80
 const FREE_HISTORY_DEFAULT_WINDOW_DAYS = 30
 const FREE_HISTORY_CACHE_DIR = path.join(os.homedir(), '.stock-review-cache')
 const FREE_HISTORY_CACHE_FILE = path.join(FREE_HISTORY_CACHE_DIR, 'daily-bars-cache-v1.json')
-const FULL_HISTORY_CACHE_DIR = path.join(FREE_HISTORY_CACHE_DIR, 'all-market-history')
-const FULL_HISTORY_DAILY_CACHE_DIR = path.join(FULL_HISTORY_CACHE_DIR, 'daily')
-const FULL_HISTORY_STOCK_LIST_FILE = path.join(FULL_HISTORY_CACHE_DIR, 'all-market-stocks.json')
-const FULL_HISTORY_DATE_INDEX_FILE = path.join(FULL_HISTORY_CACHE_DIR, 'all-market-history-date-index.json')
+const STOCK_REVIEW_SYSTEM_DATA_DIR = process.env.LOCALAPPDATA
+  ? path.join(process.env.LOCALAPPDATA, '股研录')
+  : path.join(os.homedir(), '.stock-review')
+const FULL_HISTORY_DATA_DIR = path.join(STOCK_REVIEW_SYSTEM_DATA_DIR, 'history-data')
+const FULL_HISTORY_DAILY_DATA_DIR = path.join(FULL_HISTORY_DATA_DIR, 'daily')
+const FULL_HISTORY_STOCK_LIST_NAME = 'all-market-stocks.json'
+const FULL_HISTORY_STOCK_LIST_FILE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_STOCK_LIST_NAME)
+const FULL_HISTORY_DATE_INDEX_FILE = path.join(FULL_HISTORY_DATA_DIR, 'all-market-history-date-index.json')
+const FULL_HISTORY_SNAPSHOT_EXECUTABLE = path.join(FULL_HISTORY_DATA_DIR, 'fetch_all_a_stocks_v2.exe')
+const FULL_HISTORY_EXECUTABLE_NAME = 'fetch_a_stock_history_by_stock.exe'
+const FULL_HISTORY_EXECUTABLE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_EXECUTABLE_NAME)
+const FULL_HISTORY_CALCULATE_STOCK_LIST_NAME = 'all-market-stocks-Calculate.json'
+const FULL_HISTORY_CALCULATE_STOCK_LIST_FILE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_CALCULATE_STOCK_LIST_NAME)
+const FULL_HISTORY_OUTPUT_DIR_NAME = 'all-market-history-by-stock'
+const FULL_HISTORY_OUTPUT_DIR = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_OUTPUT_DIR_NAME)
+const FULL_HISTORY_STOCK_INDEX_NAME = 'stock-history-index.json'
+const FULL_HISTORY_STOCK_INDEX_FILE = path.join(FULL_HISTORY_OUTPUT_DIR, FULL_HISTORY_STOCK_INDEX_NAME)
+const FULL_HISTORY_ROOT_STOCK_INDEX_FILE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_STOCK_INDEX_NAME)
 const FULL_HISTORY_DAILY_CACHE_VERSION = 1
 const FULL_HISTORY_DAILY_BATCH_SIZE = 80
 const FULL_HISTORY_DAILY_CONCURRENCY = STOCK_REQUEST_DEFAULT_CONCURRENCY
@@ -118,6 +132,7 @@ let eastmoneyAllSpotCache = {
   result: null
 }
 let fullHistoryJob = createFullHistoryJob({ status: 'idle', message: '尚未开始全市场历史同步' })
+let fullHistoryProcess = null
 const DESKTOP_WINDOW_BASE_URL = 'index.html'
 const DESKTOP_WINDOW_FEATURE_CODES = new Set(['stock-review', 'stock-pool', 'risk-watch'])
 let stockReviewDesktopWindow = null
@@ -2590,7 +2605,37 @@ function clampFullHistoryDelay(value) {
 }
 
 function normalizeFullHistoryDate(value) {
-  return ymdToDateParam(value)
+  const digits = String(value || '').replace(/\D/g, '').slice(0, 8)
+  if (!/^\d{8}$/.test(digits)) return ''
+  return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`
+}
+
+function resolveFullHistoryStockIndexFile() {
+  if (fs.existsSync(FULL_HISTORY_STOCK_INDEX_FILE)) return FULL_HISTORY_STOCK_INDEX_FILE
+  if (fs.existsSync(FULL_HISTORY_ROOT_STOCK_INDEX_FILE)) return FULL_HISTORY_ROOT_STOCK_INDEX_FILE
+  return FULL_HISTORY_STOCK_INDEX_FILE
+}
+
+function buildFullHistoryArgs(startDate, endDate) {
+  return [
+    '--start', normalizeFullHistoryDate(startDate),
+    '--end', normalizeFullHistoryDate(endDate),
+    '--stock-list-file', FULL_HISTORY_CALCULATE_STOCK_LIST_NAME,
+    '--output-dir', FULL_HISTORY_OUTPUT_DIR_NAME,
+    '--source', 'baostock',
+    '--resume'
+  ]
+}
+
+function quoteCommandArgument(value) {
+  const text = String(value || '')
+  return /\s/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text
+}
+
+function buildFullHistoryCommand(startDate, endDate) {
+  const start = normalizeFullHistoryDate(startDate) || '<开始日期>'
+  const end = normalizeFullHistoryDate(endDate) || '<结束日期>'
+  return `${FULL_HISTORY_EXECUTABLE_NAME} --start ${quoteCommandArgument(start)} --end ${quoteCommandArgument(end)} --stock-list-file "${FULL_HISTORY_CALCULATE_STOCK_LIST_NAME}" --output-dir "${FULL_HISTORY_OUTPUT_DIR_NAME}" --source baostock --resume`
 }
 
 // 创建全市场历史同步任务对象，前端轮询看到的状态都从这里派生。
@@ -2618,8 +2663,22 @@ function createFullHistoryJob(base = {}, items = []) {
     currentName: base.currentName || '',
     nextRequestAt: base.nextRequestAt || null,
     outputFile: base.outputFile || '',
-    dailyDir: base.dailyDir || FULL_HISTORY_DAILY_CACHE_DIR,
+    outputDir: base.outputDir || FULL_HISTORY_OUTPUT_DIR,
+    dailyDir: base.dailyDir || FULL_HISTORY_DAILY_DATA_DIR,
     stockListFile: base.stockListFile || FULL_HISTORY_STOCK_LIST_FILE,
+    calculateStockListFile: base.calculateStockListFile || FULL_HISTORY_CALCULATE_STOCK_LIST_FILE,
+    stockIndexFile: base.stockIndexFile || resolveFullHistoryStockIndexFile(),
+    executable: base.executable || FULL_HISTORY_EXECUTABLE,
+    command: base.command || '',
+    processId: Number(base.processId) || null,
+    requiresCleanup: Boolean(base.requiresCleanup),
+    cleanupReason: base.cleanupReason || '',
+    indexStartDate: normalizeFullHistoryDate(base.indexStartDate),
+    indexEndDate: normalizeFullHistoryDate(base.indexEndDate),
+    indexedStockCount: Number(base.indexedStockCount) || 0,
+    missingStockCount: Number(base.missingStockCount) || 0,
+    stdout: String(base.stdout || ''),
+    stderr: String(base.stderr || ''),
     dateIndexFile: base.dateIndexFile || FULL_HISTORY_DATE_INDEX_FILE,
     metaFile: base.metaFile || '',
     fetched: Number(base.fetched) || 0,
@@ -2669,12 +2728,13 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
   const total = items.length
   const legacyFetched = items.filter(item => item.status === 'done').length
   const legacyFailed = items.filter(item => item.status === 'failed').length
-  const legacyPending = items.filter(item => item.status === 'pending').length
+  const legacySkipped = items.filter(item => item.status === 'skipped').length
+  const legacyPending = items.filter(item => ['pending', 'running'].includes(item.status)).length
   const recordTotal = dates.length ? dates.reduce((sum, item) => sum + (Number(item.stockCount) || total), 0) : total
-  const processed = dates.length ? Number(job?.processed) || dates.reduce((sum, item) => sum + (Number(item.processed) || 0), 0) : legacyFetched + legacyFailed
+  const processed = dates.length ? Number(job?.processed) || dates.reduce((sum, item) => sum + (Number(item.processed) || 0), 0) : legacyFetched + legacyFailed + legacySkipped
   const fetched = dates.length ? Number(job?.fetched) || dates.reduce((sum, item) => sum + (Number(item.fetched) || 0), 0) : legacyFetched
   const failed = dates.length ? Number(job?.failed) || dates.reduce((sum, item) => sum + (Number(item.failed) || 0), 0) : legacyFailed
-  const skipped = dates.length ? Number(job?.skipped) || dates.reduce((sum, item) => sum + (Number(item.skipped) || 0), 0) : items.filter(item => item.status === 'skipped').length
+  const skipped = dates.length ? Number(job?.skipped) || dates.reduce((sum, item) => sum + (Number(item.skipped) || 0), 0) : legacySkipped
   const pending = dates.length ? Math.max(0, recordTotal - processed) : legacyPending
   const failedTasks = Array.isArray(job?.failedTasks) ? job.failedTasks : []
 
@@ -2694,10 +2754,27 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     currentName: job?.currentName || '',
     nextRequestAt: job?.nextRequestAt || null,
     outputFile: job?.outputFile || '',
-    dailyDir: job?.dailyDir || FULL_HISTORY_DAILY_CACHE_DIR,
+    outputDir: job?.outputDir || FULL_HISTORY_OUTPUT_DIR,
+    dataDir: FULL_HISTORY_DATA_DIR,
+    dailyDir: job?.dailyDir || FULL_HISTORY_DAILY_DATA_DIR,
     stockListFile: job?.stockListFile || FULL_HISTORY_STOCK_LIST_FILE,
+    calculateStockListFile: job?.calculateStockListFile || FULL_HISTORY_CALCULATE_STOCK_LIST_FILE,
+    stockIndexFile: job?.stockIndexFile || resolveFullHistoryStockIndexFile(),
+    snapshotExecutable: FULL_HISTORY_SNAPSHOT_EXECUTABLE,
+    snapshotCommand: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} --output ${FULL_HISTORY_STOCK_LIST_NAME} --source baostock`,
     dateIndexFile: job?.dateIndexFile || FULL_HISTORY_DATE_INDEX_FILE,
     metaFile: job?.metaFile || '',
+    historyExecutable: job?.executable || FULL_HISTORY_EXECUTABLE,
+    historyCommand: job?.command || buildFullHistoryCommand(job?.startDate, job?.endDate),
+    processId: Number(job?.processId) || null,
+    requiresCleanup: Boolean(job?.requiresCleanup),
+    cleanupReason: job?.cleanupReason || '',
+    indexStartDate: job?.indexStartDate || '',
+    indexEndDate: job?.indexEndDate || '',
+    indexedStockCount: Number(job?.indexedStockCount) || 0,
+    missingStockCount: Number(job?.missingStockCount) || 0,
+    stdout: String(job?.stdout || ''),
+    stderr: String(job?.stderr || ''),
     total,
     stockTotal: total,
     dateTotal: dates.length,
@@ -2709,7 +2786,7 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     pending,
     progress: dates.length
       ? (recordTotal ? Math.round((processed / recordTotal) * 10000) / 100 : 0)
-      : (total ? Math.round(((fetched + failed) / total) * 10000) / 100 : 0),
+      : (total ? Math.round(((fetched + failed + skipped) / total) * 10000) / 100 : 0),
     errors: (job?.errors || []).slice(-20),
     failedTaskCount: failedTasks.length,
     failedTasks: failedTasks.slice(-200),
@@ -2747,8 +2824,8 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
 }
 
 function ensureFullHistoryDir() {
-  fs.mkdirSync(FULL_HISTORY_CACHE_DIR, { recursive: true })
-  fs.mkdirSync(FULL_HISTORY_DAILY_CACHE_DIR, { recursive: true })
+  fs.mkdirSync(FULL_HISTORY_DATA_DIR, { recursive: true })
+  fs.mkdirSync(FULL_HISTORY_DAILY_DATA_DIR, { recursive: true })
 }
 
 function createFullHistoryOutputPaths(startDate, endDate) {
@@ -2757,11 +2834,11 @@ function createFullHistoryOutputPaths(startDate, endDate) {
   const range = `${ymd(startDate, '00000000')}_${ymd(endDate, '99999999')}`
   const base = `all-market-history-${range}-${timestamp}`
   return {
-    outputFile: FULL_HISTORY_DAILY_CACHE_DIR,
-    dailyDir: FULL_HISTORY_DAILY_CACHE_DIR,
+    outputFile: FULL_HISTORY_DAILY_DATA_DIR,
+    dailyDir: FULL_HISTORY_DAILY_DATA_DIR,
     stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
     dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
-    metaFile: path.join(FULL_HISTORY_CACHE_DIR, `${base}.meta.json`)
+    metaFile: path.join(FULL_HISTORY_DATA_DIR, `${base}.meta.json`)
   }
 }
 
@@ -2775,7 +2852,7 @@ function atomicWriteJson(file, payload) {
 
 function readJsonFile(file) {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'))
+    return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''))
   } catch {
     return null
   }
@@ -2903,11 +2980,13 @@ function writeFullMarketStockList(items, source = 'eastmoney_clist') {
 
 function readFullMarketStockList() {
   const payload = readJsonFile(FULL_HISTORY_STOCK_LIST_FILE)
-  if (!payload || !Array.isArray(payload.stocks)) return null
+  if (!payload) return null
+  const stocks = extractFullMarketStockListRows(payload)
+  if (!stocks.length) return null
 
-  const items = payload.stocks.map(item => ({
-    code: normalizeCacheCode(item.code || item.thscode || ''),
-    name: String(item.name || item.stockName || item.code || '').trim(),
+  const items = stocks.map(item => ({
+    code: normalizeFullMarketStockCode(item),
+    name: String(item?.name || item?.code_name || item?.stockName || item?.stock_name || item?.securityName || item?.code || '').trim(),
     status: 'pending',
     rowCount: 0,
     failedCount: 0,
@@ -2915,7 +2994,465 @@ function readFullMarketStockList() {
     updatedAt: null
   })).filter(item => item.code)
 
-  return items.length ? items : null
+  const deduped = new Map(items.map(item => [item.code, item]))
+  return deduped.size
+    ? Array.from(deduped.values()).sort((a, b) => a.code.localeCompare(b.code))
+    : null
+}
+
+function extractFullMarketStockListRows(payload) {
+  if (Array.isArray(payload)) return payload
+  if (!payload || typeof payload !== 'object') return []
+  const candidates = [payload.stocks, payload.items, payload.list, payload.rows, payload.records, payload.data, payload.result]
+  for (const candidate of candidates) {
+    const rows = extractFullMarketStockListRows(candidate)
+    if (rows.length) return rows
+  }
+  return []
+}
+
+function normalizeFullMarketStockCode(item) {
+  const rawValue = item?.code || item?.thscode || item?.ts_code || item?.stockCode || item?.stock_code || item?.symbol || ''
+  const raw = String(rawValue).trim().toUpperCase()
+  const prefixMatch = raw.match(/^(SH|SZ|BJ)[.\-_]?(\d{6})$/)
+  if (prefixMatch) return `${prefixMatch[2]}.${prefixMatch[1]}`
+  const suffixMatch = raw.match(/^(\d{6})[.\-_]?(SH|SZ|BJ)$/)
+  if (suffixMatch) return `${suffixMatch[1]}.${suffixMatch[2]}`
+
+  const symbol = String(item?.symbol || raw).replace(/\D/g, '').padStart(6, '0')
+  if (!/^\d{6}$/.test(symbol)) return ''
+  const marketValue = String(item?.market || item?.exchange || '').trim().toUpperCase()
+  const market = ['SH', 'SSE', 'XSHG'].includes(marketValue)
+    ? 'SH'
+    : ['SZ', 'SZSE', 'XSHE'].includes(marketValue)
+      ? 'SZ'
+      : ['BJ', 'BSE'].includes(marketValue)
+        ? 'BJ'
+        : normalizeCacheCode(symbol).split('.')[1]
+  return market ? `${symbol}.${market}` : ''
+}
+
+function extractFullHistoryIndexRows(payload) {
+  if (Array.isArray(payload)) {
+    return payload.map(item => (typeof item === 'string' ? { code: item } : item)).filter(Boolean)
+  }
+  if (!payload || typeof payload !== 'object') return []
+
+  const candidates = [
+    payload.stocks,
+    payload.items,
+    payload.records,
+    payload.entries,
+    payload.index,
+    payload.stockHistoryIndex,
+    payload.stockIndex,
+    payload.data,
+    payload.data?.stocks,
+    payload.data?.items,
+    payload.data?.records
+  ]
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    const rows = extractFullHistoryIndexRows(candidate)
+    if (rows.length) return rows
+  }
+
+  return Object.entries(payload)
+    .map(([code, value]) => {
+      const normalizedCode = normalizeFullMarketStockCode({ code })
+      if (!normalizedCode || value == null || Array.isArray(value)) return null
+      if (typeof value === 'string') return { code, filePath: value }
+      if (typeof value !== 'object') return null
+      return { code, ...value }
+    })
+    .filter(Boolean)
+}
+
+function fullHistoryIndexDateRange(payload, rows = []) {
+  const metadata = payload?.metadata || payload?.meta || {}
+  const range = payload?.dateRange || payload?.range || metadata?.dateRange || metadata?.range || {}
+  const startCandidates = [
+    payload?.startDate,
+    payload?.start,
+    payload?.start_date,
+    payload?.requestedStart,
+    payload?.date_start,
+    range?.startDate,
+    range?.start,
+    metadata?.startDate,
+    metadata?.start,
+    metadata?.start_date,
+    metadata?.requestedStart,
+    metadata?.date_start
+  ]
+  const endCandidates = [
+    payload?.endDate,
+    payload?.end,
+    payload?.end_date,
+    payload?.requestedEnd,
+    payload?.date_end,
+    range?.endDate,
+    range?.end,
+    metadata?.endDate,
+    metadata?.end,
+    metadata?.end_date,
+    metadata?.requestedEnd,
+    metadata?.date_end
+  ]
+  const rowStarts = rows.map(item => normalizeFullHistoryDate(item?.startDate || item?.start || item?.start_date)).filter(Boolean)
+  const rowEnds = rows.map(item => normalizeFullHistoryDate(item?.endDate || item?.end || item?.end_date)).filter(Boolean)
+  const startDate = startCandidates.map(normalizeFullHistoryDate).find(Boolean) || (rowStarts.length ? rowStarts.sort()[0] : '')
+  const endDate = endCandidates.map(normalizeFullHistoryDate).find(Boolean) || (rowEnds.length ? rowEnds.sort().at(-1) : '')
+  return { startDate, endDate }
+}
+
+function fullHistoryIndexRowCount(item) {
+  const direct = [
+    item?.rowCount,
+    item?.row_count,
+    item?.klineCount,
+    item?.kLineCount,
+    item?.kline_count,
+    item?.recordCount,
+    item?.dataCount,
+    item?.count,
+    item?.bars,
+    item?.rows
+  ].map(Number).find(Number.isFinite)
+  if (Number.isFinite(direct)) return Math.max(0, direct)
+  if (Array.isArray(item?.rows)) return item.rows.length
+  if (Array.isArray(item?.data)) return item.data.length
+  return 0
+}
+
+function normalizeFullHistoryIndexStatus(item) {
+  const raw = String(item?.status || item?.state || item?.result || '').trim().toLowerCase()
+  if (['done', 'completed', 'complete', 'success', 'succeeded', 'ok', 'finished', '完成', '已完成', '成功'].includes(raw)) return 'done'
+  if (['failed', 'failure', 'error', '失败', '错误'].includes(raw)) return 'failed'
+  if (['skipped', 'skip', 'no_data', 'nodata', 'empty', '跳过', '无数据'].includes(raw)) return 'skipped'
+  if (['running', 'processing', 'fetching', 'in_progress', '运行中', '处理中', '获取中'].includes(raw)) return 'running'
+  if (['pending', 'waiting', 'queued', '等待', '未获取', '排队中'].includes(raw)) return 'pending'
+  return fullHistoryIndexRowCount(item) > 0 ? 'done' : 'done'
+}
+
+function fullHistoryIndexMessage(item, status) {
+  const message = String(item?.message || item?.remark || item?.note || item?.errorMessage || item?.error || '').trim()
+  if (message) return message
+  if (status === 'done') return '已写入历史数据'
+  if (status === 'failed') return '获取失败'
+  if (status === 'skipped') return '无历史数据'
+  if (status === 'running') return '获取中'
+  return '未获取'
+}
+
+function readFullHistoryStockIndex() {
+  const filePath = resolveFullHistoryStockIndexFile()
+  const exists = fs.existsSync(filePath)
+  if (!exists) {
+    return {
+      filePath,
+      exists: false,
+      readable: true,
+      payload: null,
+      rows: [],
+      rowsByCode: new Map(),
+      startDate: '',
+      endDate: ''
+    }
+  }
+
+  const payload = readJsonFile(filePath)
+  if (!payload) {
+    return {
+      filePath,
+      exists: true,
+      readable: false,
+      payload: null,
+      rows: [],
+      rowsByCode: new Map(),
+      startDate: '',
+      endDate: ''
+    }
+  }
+
+  const rows = extractFullHistoryIndexRows(payload)
+  const rowsByCode = new Map()
+  rows.forEach(item => {
+    const code = normalizeFullMarketStockCode(item)
+    if (code) rowsByCode.set(code, item)
+  })
+  const { startDate, endDate } = fullHistoryIndexDateRange(payload, rows)
+  return { filePath, exists: true, readable: true, payload, rows, rowsByCode, startDate, endDate }
+}
+
+function readCombinedFullHistoryItems() {
+  const snapshotPayload = readJsonFile(FULL_HISTORY_STOCK_LIST_FILE)
+  const snapshotRows = extractFullMarketStockListRows(snapshotPayload)
+  const snapshotItems = readFullMarketStockList() || []
+  const index = readFullHistoryStockIndex()
+  const items = snapshotItems.map(item => {
+    const indexItem = index.rowsByCode.get(item.code)
+    if (!indexItem) {
+      return {
+        ...item,
+        status: 'pending',
+        rowCount: 0,
+        failedCount: 0,
+        message: '股票数据索引中暂无记录',
+        updatedAt: null
+      }
+    }
+    const status = normalizeFullHistoryIndexStatus(indexItem)
+    return {
+      ...item,
+      status,
+      rowCount: fullHistoryIndexRowCount(indexItem),
+      failedCount: status === 'failed' ? 1 : 0,
+      skippedCount: status === 'skipped' ? 1 : 0,
+      message: fullHistoryIndexMessage(indexItem, status),
+      updatedAt: indexItem.updatedAt || indexItem.updateTime || indexItem.lastUpdated || indexItem.last_updated || indexItem.finishedAt || indexItem.fetchedAt || indexItem.generatedAt || null
+    }
+  })
+  return { snapshotPayload, snapshotRows, items, index }
+}
+
+function buildCalculateStockListPayload(snapshotPayload, stocks, startDate, endDate) {
+  if (snapshotPayload && !Array.isArray(snapshotPayload) && Array.isArray(snapshotPayload.stocks)) {
+    return {
+      ...snapshotPayload,
+      generatedAt: new Date().toISOString(),
+      stockCount: stocks.length,
+      calculationStartDate: startDate,
+      calculationEndDate: endDate,
+      stocks
+    }
+  }
+  if (Array.isArray(snapshotPayload)) return stocks
+  return {
+    schemaVersion: 1,
+    type: 'all_market_stock_list',
+    source: snapshotPayload?.source || 'snapshot',
+    generatedAt: new Date().toISOString(),
+    stockCount: stocks.length,
+    calculationStartDate: startDate,
+    calculationEndDate: endDate,
+    stocks
+  }
+}
+
+function prepareFullHistoryExecutableInput(startDate, endDate) {
+  const combined = readCombinedFullHistoryItems()
+  if (!combined.snapshotPayload || !combined.snapshotRows.length) {
+    const indexText = combined.index.exists ? `；检测到索引 ${combined.index.filePath}，但缺少快照清单` : ''
+    throw new Error(`未找到有效的快照清单：${FULL_HISTORY_STOCK_LIST_FILE}${indexText}`)
+  }
+  if (combined.index.exists && !combined.index.readable) {
+    throw new Error(`股票数据索引不是有效 JSON：${combined.index.filePath}`)
+  }
+
+  if (!combined.index.exists) {
+    fs.copyFileSync(FULL_HISTORY_STOCK_LIST_FILE, FULL_HISTORY_CALCULATE_STOCK_LIST_FILE)
+    return {
+      ...combined,
+      calculateCount: combined.snapshotRows.length,
+      missingStockCount: combined.snapshotRows.length,
+      noWork: false,
+      requiresCleanup: false
+    }
+  }
+
+  const indexStartDate = combined.index.startDate
+  const indexEndDate = combined.index.endDate
+  if (!indexStartDate || !indexEndDate || indexStartDate !== startDate || indexEndDate !== endDate) {
+    const actualRange = indexStartDate && indexEndDate ? `${indexStartDate} 至 ${indexEndDate}` : '索引中未记录完整日期范围'
+    return {
+      ...combined,
+      calculateCount: 0,
+      missingStockCount: 0,
+      noWork: false,
+      requiresCleanup: true,
+      cleanupReason: `页面日期为 ${startDate} 至 ${endDate}，已有历史数据范围为 ${actualRange}。继续前需要删除旧的历史输出和股票数据索引。`
+    }
+  }
+
+  const missingStocks = combined.snapshotRows.filter(item => {
+    const code = normalizeFullMarketStockCode(item)
+    return code && !combined.index.rowsByCode.has(code)
+  })
+  const payload = buildCalculateStockListPayload(combined.snapshotPayload, missingStocks, startDate, endDate)
+  atomicWriteJson(FULL_HISTORY_CALCULATE_STOCK_LIST_FILE, payload)
+  return {
+    ...combined,
+    calculateCount: missingStocks.length,
+    missingStockCount: missingStocks.length,
+    noWork: missingStocks.length === 0,
+    requiresCleanup: false
+  }
+}
+
+function refreshFullHistoryJobItemsFromDisk(job = fullHistoryJob) {
+  const combined = readCombinedFullHistoryItems()
+  if (combined.items.length && (!combined.index.exists || combined.index.readable)) {
+    job.items = combined.items
+  }
+  job.stockIndexFile = combined.index.filePath
+  job.indexStartDate = combined.index.startDate
+  job.indexEndDate = combined.index.endDate
+  job.indexedStockCount = combined.index.rowsByCode.size
+  job.missingStockCount = combined.items.filter(item => item.status === 'pending').length
+  return combined
+}
+
+function appendFullHistoryProcessOutput(job, key, chunk) {
+  const next = `${job[key] || ''}${Buffer.from(chunk).toString('utf8')}`
+  job[key] = next.slice(-12000)
+}
+
+function startFullHistoryExecutableProcess(job) {
+  const args = buildFullHistoryArgs(job.startDate, job.endDate)
+  fs.mkdirSync(FULL_HISTORY_OUTPUT_DIR, { recursive: true })
+  const child = spawn(FULL_HISTORY_EXECUTABLE, args, {
+    cwd: FULL_HISTORY_DATA_DIR,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    shell: false
+  })
+  fullHistoryProcess = child
+  job.status = 'running'
+  job.processId = Number(child.pid) || null
+  job.command = buildFullHistoryCommand(job.startDate, job.endDate)
+  job.message = `历史数据程序已启动，进程 PID ${job.processId || '--'}`
+
+  let finalized = false
+  const finalize = (code, error = null) => {
+    if (finalized) return
+    finalized = true
+    if (fullHistoryProcess === child) fullHistoryProcess = null
+    job.processId = null
+    job.finishedAt = new Date().toISOString()
+    const combined = refreshFullHistoryJobItemsFromDisk(job)
+
+    if (job.cancelRequested) {
+      job.status = 'stopped'
+      job.message = '已停止历史数据程序'
+      return
+    }
+    if (error) {
+      job.status = 'failed'
+      job.message = `历史数据程序启动失败：${error.message || error}`
+      addFullHistoryError(job, job.message)
+      return
+    }
+    if (code !== 0) {
+      const detail = String(job.stderr || job.stdout || '').trim().slice(-1000)
+      job.status = 'failed'
+      job.message = `历史数据程序执行失败，退出码 ${code}${detail ? `：${detail}` : ''}`
+      addFullHistoryError(job, job.message)
+      return
+    }
+    if (!combined.index.exists || !combined.index.readable) {
+      job.status = 'failed'
+      job.message = `历史数据程序已退出，但未生成有效的股票数据索引：${resolveFullHistoryStockIndexFile()}`
+      addFullHistoryError(job, job.message)
+      return
+    }
+    job.status = 'completed'
+    job.message = `历史数据程序执行完成，股票数据索引共 ${combined.index.rowsByCode.size} 只`
+  }
+
+  child.stdout.on('data', chunk => appendFullHistoryProcessOutput(job, 'stdout', chunk))
+  child.stderr.on('data', chunk => appendFullHistoryProcessOutput(job, 'stderr', chunk))
+  child.on('error', error => finalize(null, error))
+  child.on('close', code => finalize(code))
+  return child
+}
+
+function terminateFullHistoryProcess(child) {
+  if (!child || !child.pid) return Promise.resolve(false)
+  if (process.platform !== 'win32') {
+    try {
+      return Promise.resolve(child.kill('SIGTERM'))
+    } catch {
+      return Promise.resolve(false)
+    }
+  }
+
+  return new Promise(resolve => {
+    const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      shell: false
+    })
+    let settled = false
+    const finish = result => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+    const timer = setTimeout(() => {
+      try {
+        killer.kill()
+      } catch {}
+      try {
+        child.kill()
+      } catch {}
+      finish(false)
+    }, 10000)
+    killer.on('error', () => {
+      clearTimeout(timer)
+      try {
+        child.kill()
+      } catch {}
+      finish(false)
+    })
+    killer.on('close', code => {
+      clearTimeout(timer)
+      if (code !== 0) {
+        try {
+          child.kill()
+        } catch {}
+      }
+      finish(code === 0)
+    })
+  })
+}
+
+function assertFullHistoryCleanupPath(target) {
+  const root = path.resolve(FULL_HISTORY_DATA_DIR)
+  const resolved = path.resolve(target)
+  const relative = path.relative(root, resolved)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`拒绝清理固定历史数据目录之外的路径：${resolved}`)
+  }
+  return resolved
+}
+
+async function cleanupFullMarketHistoryExecutableData() {
+  if (isFullHistoryActive()) throw new Error('历史数据程序运行中，无法清理；请先停止任务')
+  const targets = [
+    { path: FULL_HISTORY_OUTPUT_DIR, recursive: true },
+    { path: FULL_HISTORY_ROOT_STOCK_INDEX_FILE, recursive: false },
+    { path: FULL_HISTORY_CALCULATE_STOCK_LIST_FILE, recursive: false }
+  ]
+  const removed = []
+  for (const target of targets) {
+    const resolved = assertFullHistoryCleanupPath(target.path)
+    if (!fs.existsSync(resolved)) continue
+    await fs.promises.rm(resolved, { recursive: target.recursive, force: true })
+    removed.push(resolved)
+  }
+
+  const combined = readCombinedFullHistoryItems()
+  fullHistoryJob = createFullHistoryJob({
+    status: 'ready',
+    stockIndexFile: resolveFullHistoryStockIndexFile(),
+    message: `旧历史数据已清理${removed.length ? `：${removed.join('、')}` : '，没有发现需要删除的文件'}。请确认日期后重新点击“开始获取”`
+  }, combined.items)
+  return {
+    ...buildFullHistorySnapshot(fullHistoryJob),
+    cleanupCompleted: true,
+    removedPaths: removed
+  }
 }
 
 function readFullMarketStockListFromDailyCache() {
@@ -2943,11 +3480,11 @@ function readFullMarketStockListFromDailyCache() {
     if (filePath) collect(readJsonFile(filePath))
   })
 
-  if (!itemsByCode.size && fs.existsSync(FULL_HISTORY_DAILY_CACHE_DIR)) {
+  if (!itemsByCode.size && fs.existsSync(FULL_HISTORY_DAILY_DATA_DIR)) {
     try {
-      fs.readdirSync(FULL_HISTORY_DAILY_CACHE_DIR)
+      fs.readdirSync(FULL_HISTORY_DAILY_DATA_DIR)
         .filter(fileName => fileName.endsWith('.json'))
-        .forEach(fileName => collect(readJsonFile(path.join(FULL_HISTORY_DAILY_CACHE_DIR, fileName))))
+        .forEach(fileName => collect(readJsonFile(path.join(FULL_HISTORY_DAILY_DATA_DIR, fileName))))
     } catch {}
   }
 
@@ -2969,90 +3506,101 @@ function getFullMarketStockListFallbackItems(previousItems = []) {
 
 async function loadFullMarketHistoryItemsForDaily(options = {}) {
   ensureFullHistoryDir()
-  const cachedItems = readFullMarketStockList()
-  if (!options.force) {
-    if (cachedItems?.length) return cachedItems
+  const items = readFullMarketStockList()
+  if (!items?.length) {
+    throw new Error(`未读取到股票清单，请将 ${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} 放入 ${FULL_HISTORY_DATA_DIR}，然后点击“刷新快照清单”`)
   }
-
-  const maxDurationMs = normalizeTimeoutMs(options.maxDurationMs ?? SNAPSHOT_REFRESH_MAX_MS, SNAPSHOT_REFRESH_MAX_MS)
-  const deadlineAt = Date.now() + maxDurationMs
-  let result
-  try {
-    result = await fetchFullMarketAStockList({
-      pageSize: 500,
-      retries: SNAPSHOT_REQUEST_RETRIES,
-      timeoutMs: options.timeoutMs ?? 10000,
-      baostockTimeoutMs: options.baostockTimeoutMs ?? 25000,
-      deadlineAt
-    })
-  } catch (error) {
-    const fallbackItems = getFullMarketStockListFallbackItems(cachedItems || [])
-    if (fallbackItems.length) {
-      if (typeof console !== 'undefined') {
-        console.warn('[full-history] stock list refresh failed, using cached list', error.message || error)
-      }
-      return fallbackItems.map(item => ({
-        ...item,
-        failedCount: Number(item.failedCount) || 0,
-        message: item.message || '使用缓存清单'
-      }))
-    }
-    throw new Error(`暂时无法加载全市场股票清单：${historyDisplayError(error)}`)
-  }
-
-  const items = stockListItemsToHistoryItems(result.stocks)
-  if (!items.length) throw new Error('全市场股票列表为空，无法开始历史数据同步')
-  writeFullMarketStockList(result.stocks, result.source || 'eastmoney_clist_stock_list')
   return items.map(item => ({
     ...item,
     failedCount: Number(item.failedCount) || 0,
-    message: item.message || '未获取'
+    message: item.message || '来自固定清单文件'
   }))
 }
 
-// Rebuild the all-market stock list from the latest Baostock result, falling back to Eastmoney.
+function runFullMarketStockListExecutable(options = {}) {
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(FULL_HISTORY_SNAPSHOT_EXECUTABLE)) {
+      reject(new Error(`未找到清单程序，请将 fetch_all_a_stocks_v2.exe 放入：${FULL_HISTORY_DATA_DIR}`))
+      return
+    }
+
+    const args = ['--output', FULL_HISTORY_STOCK_LIST_NAME, '--source', 'baostock']
+    const stdout = []
+    const stderr = []
+    const timeout = Math.max(30000, Number(options.timeout) || 10 * 60 * 1000)
+    let settled = false
+    const child = spawn(FULL_HISTORY_SNAPSHOT_EXECUTABLE, args, {
+      cwd: FULL_HISTORY_DATA_DIR,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      shell: false
+    })
+    const finish = callback => value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      callback(value)
+    }
+    const fail = finish(reject)
+    const succeed = finish(resolve)
+    const timer = setTimeout(() => {
+      child.kill()
+      fail(new Error(`刷新快照清单超时（${Math.round(timeout / 1000)} 秒）`))
+    }, timeout)
+
+    child.stdout.on('data', chunk => stdout.push(chunk))
+    child.stderr.on('data', chunk => stderr.push(chunk))
+    child.on('error', error => fail(new Error(`无法启动 ${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)}：${error.message}`)))
+    child.on('close', code => {
+      const outText = Buffer.concat(stdout).toString('utf8').trim()
+      const errText = Buffer.concat(stderr).toString('utf8').trim()
+      if (code !== 0) {
+        fail(new Error(errText || outText || `清单程序退出码 ${code}`))
+        return
+      }
+      succeed({
+        executable: FULL_HISTORY_SNAPSHOT_EXECUTABLE,
+        command: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} ${args.join(' ')}`,
+        stdout: outText,
+        stderr: errText
+      })
+    })
+  })
+}
+
+// 固定目录中的打包程序是刷新清单的唯一数据源。
 async function refreshFullMarketStockListFromSnapshot(options = {}) {
   if (isFullHistoryActive()) throw new Error('全市场历史任务运行中，请先停止或等待完成后再刷新股票清单')
   ensureFullHistoryDir()
 
   const startedAt = Date.now()
-  const maxDurationMs = normalizeTimeoutMs(options.maxDurationMs ?? SNAPSHOT_REFRESH_MAX_MS, SNAPSHOT_REFRESH_MAX_MS)
-  const deadlineAt = startedAt + maxDurationMs
-  const retries = Math.max(
-    0,
-    Math.trunc(Number.isFinite(Number(options.retries)) ? Number(options.retries) : SNAPSHOT_REQUEST_RETRIES)
-  )
-  const timeoutMs = normalizeTimeoutMs(options.timeoutMs ?? 10000, 10000)
-  const previousStockCount = fs.existsSync(FULL_HISTORY_STOCK_LIST_FILE)
-    ? (readFullMarketStockList() || []).length
-    : 0
+  const previousItems = readFullMarketStockList() || []
+  const previousStockCount = previousItems.length
+  const previousContent = fs.existsSync(FULL_HISTORY_STOCK_LIST_FILE)
+    ? fs.readFileSync(FULL_HISTORY_STOCK_LIST_FILE)
+    : null
+
+  fullHistoryJob = createFullHistoryJob({
+    ...fullHistoryJob,
+    status: 'preparing',
+    message: `正在运行 ${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} 刷新快照清单`
+  }, previousItems)
 
   try {
-    fs.rmSync(FULL_HISTORY_STOCK_LIST_FILE, { force: true })
-  } catch (error) {
-    throw new Error(`清除旧股票清单失败：${error.message || error}`)
-  }
+    const result = await runFullMarketStockListExecutable(options)
+    if (!fs.existsSync(FULL_HISTORY_STOCK_LIST_FILE)) {
+      throw new Error(`程序执行成功，但未生成 ${FULL_HISTORY_STOCK_LIST_FILE}`)
+    }
+    const items = readFullMarketStockList()
+    if (!items?.length) throw new Error('程序生成的股票清单为空或 JSON 格式无法识别')
 
-  try {
-    const result = await fetchFullMarketAStockList({
-      pageSize: 500,
-      retries,
-      timeoutMs,
-      baostockTimeoutMs: options.baostockTimeoutMs ?? 25000,
-      deadlineAt
-    })
-    const items = stockListItemsToHistoryItems(result.stocks)
-    if (!items.length) throw new Error('最新股票清单为空，未写入本地清单')
-
-    writeFullMarketStockList(result.stocks, result.source || 'eastmoney_clist_stock_list')
-    const sourceLabel = result.source === 'baostock' ? 'Baostock' : '东方财富'
     fullHistoryJob = createFullHistoryJob({
       ...fullHistoryJob,
       status: 'ready',
       stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
       dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
-      dailyDir: FULL_HISTORY_DAILY_CACHE_DIR,
-      message: `已清除旧清单并通过 ${sourceLabel} 生成全市场股票清单：${items.length} 只`
+      dailyDir: FULL_HISTORY_DAILY_DATA_DIR,
+      message: `已通过 Baostock 程序生成全市场股票清单：${items.length} 只`
     }, items)
 
     return {
@@ -3061,35 +3609,45 @@ async function refreshFullMarketStockListFromSnapshot(options = {}) {
       previousStockCount,
       stockListUpdated: true,
       stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
-      stockListSource: result.source,
-      stockListEndpoint: result.endpoint,
+      stockListSource: 'baostock_executable',
+      snapshotExecutable: result.executable,
+      snapshotCommand: result.command,
+      stdout: result.stdout,
+      stderr: result.stderr,
       refreshFailed: false,
       fallbackUsed: false,
-      refreshDurationMs: Date.now() - startedAt,
-      maxDurationMs
+      refreshDurationMs: Date.now() - startedAt
     }
   } catch (error) {
+    if (previousContent) {
+      try {
+        fs.writeFileSync(FULL_HISTORY_STOCK_LIST_FILE, previousContent)
+      } catch {}
+    } else {
+      try {
+        fs.rmSync(FULL_HISTORY_STOCK_LIST_FILE, { force: true })
+      } catch {}
+    }
     const displayError = historyDisplayError(error)
     fullHistoryJob = createFullHistoryJob({
       status: 'failed',
       stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
       dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
-      dailyDir: FULL_HISTORY_DAILY_CACHE_DIR,
-      message: `刷新快照清单失败，旧清单已清除：${displayError}`,
+      dailyDir: FULL_HISTORY_DAILY_DATA_DIR,
+      message: `刷新快照清单失败${previousItems.length ? '，已保留原清单' : ''}：${displayError}`,
       errors: [displayError]
-    }, [])
+    }, previousItems)
 
     return {
       ...buildFullHistorySnapshot(fullHistoryJob),
-      snapshotStockCount: 0,
+      snapshotStockCount: previousItems.length,
       previousStockCount,
       stockListUpdated: false,
       stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
       refreshFailed: true,
       fallbackUsed: false,
       error: displayError,
-      refreshDurationMs: Date.now() - startedAt,
-      maxDurationMs
+      refreshDurationMs: Date.now() - startedAt
     }
   }
 }
@@ -3123,7 +3681,7 @@ function listFullHistoryWorkdays(startDate, endDate) {
 }
 
 function getFullHistoryDailyFile(date) {
-  return path.join(FULL_HISTORY_DAILY_CACHE_DIR, `all-market-history-${date}.json`)
+  return path.join(FULL_HISTORY_DAILY_DATA_DIR, `all-market-history-${date}.json`)
 }
 
 function readFullHistoryDateIndex() {
@@ -3135,7 +3693,7 @@ function readFullHistoryDateIndex() {
       generatedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
-      dailyDir: FULL_HISTORY_DAILY_CACHE_DIR,
+      dailyDir: FULL_HISTORY_DAILY_DATA_DIR,
       dates: {}
     }
   }
@@ -3144,7 +3702,7 @@ function readFullHistoryDateIndex() {
     schemaVersion: payload.schemaVersion || FULL_HISTORY_DAILY_CACHE_VERSION,
     type: payload.type || 'all_market_history_date_index',
     stockListFile: payload.stockListFile || FULL_HISTORY_STOCK_LIST_FILE,
-    dailyDir: payload.dailyDir || FULL_HISTORY_DAILY_CACHE_DIR,
+    dailyDir: payload.dailyDir || FULL_HISTORY_DAILY_DATA_DIR,
     dates: payload.dates || {}
   }
 }
@@ -3156,7 +3714,7 @@ function writeFullHistoryDateIndex(index) {
     type: 'all_market_history_date_index',
     updatedAt: new Date().toISOString(),
     stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
-    dailyDir: FULL_HISTORY_DAILY_CACHE_DIR
+    dailyDir: FULL_HISTORY_DAILY_DATA_DIR
   })
 }
 
@@ -3838,12 +4396,20 @@ async function prepareFullMarketHistoryList(options = {}) {
   })
 
   try {
-    const items = await loadFullMarketHistoryItemsForDaily({ force: options.force })
+    const combined = readCombinedFullHistoryItems()
+    if (!combined.items.length) {
+      throw new Error(`未读取到有效快照清单：${FULL_HISTORY_STOCK_LIST_FILE}`)
+    }
     fullHistoryJob = createFullHistoryJob({
       ...fullHistoryJob,
       status: 'ready',
-      message: `已加载 ${items.length} 只股票，等待开始获取历史数据`
-    }, items)
+      stockIndexFile: combined.index.filePath,
+      indexStartDate: combined.index.startDate,
+      indexEndDate: combined.index.endDate,
+      indexedStockCount: combined.index.rowsByCode.size,
+      missingStockCount: combined.items.filter(item => item.status === 'pending').length,
+      message: `已合并快照清单与股票数据索引，共 ${combined.items.length} 只股票`
+    }, combined.items)
   } catch (error) {
     fullHistoryJob.status = 'failed'
     fullHistoryJob.message = error.message || '加载全市场股票列表失败'
@@ -3853,7 +4419,7 @@ async function prepareFullMarketHistoryList(options = {}) {
   return buildFullHistorySnapshot()
 }
 
-// 启动全市场历史K线同步：按工作日拆任务。
+// 启动固定目录中的历史数据打包程序；页面日期通过参数数组直接传入，不经过 Shell。
 async function startFullMarketHistorySync(options = {}) {
   if (isFullHistoryActive()) return buildFullHistorySnapshot()
 
@@ -3862,55 +4428,75 @@ async function startFullMarketHistorySync(options = {}) {
   if (!startDate || !endDate) throw new Error('请先选择开始时间和结束时间')
   if (startDate > endDate) throw new Error('开始时间不能晚于结束时间')
 
-  const workdays = listFullHistoryWorkdays(startDate, endDate)
-  if (!workdays.length) throw new Error('选择区间内没有工作日，请重新选择日期')
+  const prepared = prepareFullHistoryExecutableInput(startDate, endDate)
+  if (prepared.requiresCleanup) {
+    fullHistoryJob = createFullHistoryJob({
+      status: 'cleanup_required',
+      startDate,
+      endDate,
+      stockIndexFile: prepared.index.filePath,
+      requiresCleanup: true,
+      cleanupReason: prepared.cleanupReason,
+      indexStartDate: prepared.index.startDate,
+      indexEndDate: prepared.index.endDate,
+      indexedStockCount: prepared.index.rowsByCode.size,
+      message: '页面日期与已有历史数据范围不一致，需要确认清理旧数据'
+    }, prepared.items)
+    return buildFullHistorySnapshot(fullHistoryJob)
+  }
 
-  const items = fullHistoryJob?.items?.length
-    ? fullHistoryJob.items
-    : await loadFullMarketHistoryItemsForDaily()
-  const resetItems = items.map(item => ({
-    ...item,
-    status: 'pending',
-    rowCount: 0,
-    failedCount: 0,
-    message: '未获取',
-    updatedAt: null
-  }))
-  const paths = createFullHistoryOutputPaths(startDate, endDate)
+  if (prepared.noWork) {
+    fullHistoryJob = createFullHistoryJob({
+      status: 'completed',
+      startDate,
+      endDate,
+      finishedAt: new Date().toISOString(),
+      stockIndexFile: prepared.index.filePath,
+      indexStartDate: prepared.index.startDate,
+      indexEndDate: prepared.index.endDate,
+      indexedStockCount: prepared.index.rowsByCode.size,
+      missingStockCount: 0,
+      message: '快照清单中的股票均已存在于股票数据索引，无需再次获取'
+    }, prepared.items)
+    return buildFullHistorySnapshot(fullHistoryJob)
+  }
 
   fullHistoryJob = createFullHistoryJob({
-    status: 'running',
+    status: 'preparing',
     startDate,
     endDate,
-    delayMs: options.delayMs,
-    concurrency: options.concurrency,
-    adjust: options.adjust,
     startedAt: new Date().toISOString(),
-    outputFile: paths.outputFile,
-    dailyDir: paths.dailyDir,
-    stockListFile: paths.stockListFile,
-    dateIndexFile: paths.dateIndexFile,
-    metaFile: paths.metaFile,
-    selectedOnly: false,
-    selectedCodes: [],
-    dates: workdays.map(date => ({
-      date,
-      status: 'pending',
-      stockCount: resetItems.length,
-      processed: 0,
-      fetched: 0,
-      failed: 0,
-      skipped: 0,
-      failedTasks: [],
-      fileName: path.basename(getFullHistoryDailyFile(date)),
-      filePath: getFullHistoryDailyFile(date),
-      message: '等待获取'
-    })),
-    message: `开始按工作日获取 ${resetItems.length} 只，${workdays.length} 天`
-  }, resetItems)
+    outputFile: FULL_HISTORY_OUTPUT_DIR,
+    outputDir: FULL_HISTORY_OUTPUT_DIR,
+    stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+    calculateStockListFile: FULL_HISTORY_CALCULATE_STOCK_LIST_FILE,
+    stockIndexFile: prepared.index.filePath,
+    executable: FULL_HISTORY_EXECUTABLE,
+    command: buildFullHistoryCommand(startDate, endDate),
+    indexStartDate: prepared.index.startDate,
+    indexEndDate: prepared.index.endDate,
+    indexedStockCount: prepared.index.rowsByCode.size,
+    missingStockCount: prepared.missingStockCount,
+    message: `已生成计算清单 ${prepared.calculateCount} 只，正在启动历史数据程序`
+  }, prepared.items)
 
-  fullHistoryJob.promise = runFullMarketHistorySyncByStockRange(fullHistoryJob)
-  return buildFullHistorySnapshot()
+  if (!fs.existsSync(FULL_HISTORY_EXECUTABLE)) {
+    fullHistoryJob.status = 'failed'
+    fullHistoryJob.finishedAt = new Date().toISOString()
+    fullHistoryJob.message = `未找到历史数据程序，请将 ${FULL_HISTORY_EXECUTABLE_NAME} 放入：${FULL_HISTORY_DATA_DIR}`
+    fullHistoryJob.errors.push(fullHistoryJob.message)
+    return buildFullHistorySnapshot(fullHistoryJob)
+  }
+
+  try {
+    startFullHistoryExecutableProcess(fullHistoryJob)
+  } catch (error) {
+    fullHistoryJob.status = 'failed'
+    fullHistoryJob.finishedAt = new Date().toISOString()
+    fullHistoryJob.message = `无法启动历史数据程序：${error.message || error}`
+    fullHistoryJob.errors.push(fullHistoryJob.message)
+  }
+  return buildFullHistorySnapshot(fullHistoryJob)
 }
 
 function normalizeFailedHistoryTask(task) {
@@ -3959,12 +4545,12 @@ function readFullHistoryFailedTasksFromDailyFiles() {
     tasks.push(...failedTasksFromDailyPayload(payload))
   })
 
-  if (!tasks.length && fs.existsSync(FULL_HISTORY_DAILY_CACHE_DIR)) {
+  if (!tasks.length && fs.existsSync(FULL_HISTORY_DAILY_DATA_DIR)) {
     try {
-      fs.readdirSync(FULL_HISTORY_DAILY_CACHE_DIR)
+      fs.readdirSync(FULL_HISTORY_DAILY_DATA_DIR)
         .filter(fileName => fileName.endsWith('.json'))
         .forEach(fileName => {
-          const payload = readJsonFile(path.join(FULL_HISTORY_DAILY_CACHE_DIR, fileName))
+          const payload = readJsonFile(path.join(FULL_HISTORY_DAILY_DATA_DIR, fileName))
           tasks.push(...failedTasksFromDailyPayload(payload))
         })
     } catch {}
@@ -3972,87 +4558,20 @@ function readFullHistoryFailedTasksFromDailyFiles() {
   return tasks
 }
 
-// 从日缓存或当前任务中提取失败记录，只补跑失败的股票/日期组合。
-async function retryFullMarketFailedTasks(options = {}) {
-  if (isFullHistoryActive()) return buildFullHistorySnapshot()
+async function cancelFullMarketHistorySync() {
+  if (!isFullHistoryActive()) return buildFullHistorySnapshot()
+  fullHistoryJob.cancelRequested = true
+  fullHistoryJob.status = 'stopping'
+  fullHistoryJob.message = fullHistoryProcess?.pid
+    ? `正在停止历史数据程序，进程 PID ${fullHistoryProcess.pid}`
+    : '正在停止历史数据任务'
 
-  const inputTasks = Array.isArray(options.failedTasks) && options.failedTasks.length
-    ? options.failedTasks
-    : (Array.isArray(fullHistoryJob?.failedTasks) ? fullHistoryJob.failedTasks : [])
-  let failedTasks = inputTasks.map(normalizeFailedHistoryTask).filter(Boolean)
-  if (!failedTasks.length) {
-    failedTasks = readFullHistoryFailedTasksFromDailyFiles()
-  }
-  if (!failedTasks.length) throw new Error('没有可补跑的失败任务')
-
-  const taskMap = new Map()
-  const nameByCode = new Map()
-  failedTasks.forEach(task => {
-    if (!taskMap.has(task.date)) taskMap.set(task.date, new Set())
-    taskMap.get(task.date).add(task.code)
-    if (task.name) nameByCode.set(task.code, task.name)
-  })
-  const dates = Array.from(taskMap.keys()).sort()
-  const codes = Array.from(new Set(dates.flatMap(date => Array.from(taskMap.get(date))))).sort()
-  const cachedItems = fullHistoryJob?.items?.length ? fullHistoryJob.items : (readFullMarketStockList() || [])
-  const itemByCode = new Map(cachedItems.map(item => [normalizeCacheCode(item.code), item]))
-  const retryTaskMap = Object.fromEntries(dates.map(date => [date, Array.from(taskMap.get(date)).sort()]))
-  const resetItems = codes.map(code => ({
-    ...(itemByCode.get(code) || {}),
-    code,
-    name: nameByCode.get(code) || itemByCode.get(code)?.name || code,
-    status: 'pending',
-    rowCount: 0,
-    failedCount: 0,
-    message: '等待补跑',
-    updatedAt: null
-  }))
-  const startDate = dates[0]
-  const endDate = dates[dates.length - 1]
-  const paths = createFullHistoryOutputPaths(startDate, endDate)
-
-  fullHistoryJob = createFullHistoryJob({
-    status: 'running',
-    startDate,
-    endDate,
-    delayMs: options.delayMs,
-    concurrency: options.concurrency,
-    adjust: options.adjust || fullHistoryJob?.adjust || '1',
-    startedAt: new Date().toISOString(),
-    outputFile: paths.outputFile,
-    dailyDir: paths.dailyDir,
-    stockListFile: paths.stockListFile,
-    dateIndexFile: paths.dateIndexFile,
-    metaFile: paths.metaFile,
-    selectedOnly: true,
-    selectedCodes: resetItems.map(item => item.code),
-    retryTaskMap,
-    dates: dates.map(date => ({
-      date,
-      status: 'pending',
-      stockCount: retryTaskMap[date].length,
-      processed: 0,
-      fetched: 0,
-      failed: 0,
-      skipped: 0,
-      failedTasks: [],
-      fileName: path.basename(getFullHistoryDailyFile(date)),
-      filePath: getFullHistoryDailyFile(date),
-      message: '等待补跑'
-    })),
-    message: `开始补跑失败任务 ${failedTasks.length} 条，股票 ${resetItems.length} 只，日期 ${dates.length} 天`
-  }, resetItems)
-
-  fullHistoryJob.promise = runFullMarketHistorySyncByStockRange(fullHistoryJob)
-  return buildFullHistorySnapshot()
-}
-
-function cancelFullMarketHistorySync() {
-  if (isFullHistoryActive()) {
-    fullHistoryJob.cancelRequested = true
-    fullHistoryJob.status = 'stopping'
-    fullHistoryJob.message = '正在停止，当前请求结束后会暂停'
-    writeFullHistoryMeta(fullHistoryJob)
+  if (fullHistoryProcess) {
+    await terminateFullHistoryProcess(fullHistoryProcess)
+  } else {
+    fullHistoryJob.status = 'stopped'
+    fullHistoryJob.finishedAt = new Date().toISOString()
+    fullHistoryJob.message = '历史数据任务已停止'
   }
   return buildFullHistorySnapshot()
 }
@@ -4146,14 +4665,44 @@ window.stockReviewBridge = {
   async startFullMarketHistorySync(options) {
     return startFullMarketHistorySync(options)
   },
-  async retryFullMarketFailedTasks(options) {
-    return retryFullMarketFailedTasks(options)
-  },
   async cancelFullMarketHistorySync() {
     return cancelFullMarketHistorySync()
   },
+  async cleanupFullMarketHistoryExecutableData() {
+    return cleanupFullMarketHistoryExecutableData()
+  },
   async getFullMarketHistorySyncStatus() {
+    ensureFullHistoryDir()
+    const combined = readCombinedFullHistoryItems()
+    if (combined.items.length && (!combined.index.exists || combined.index.readable)) {
+      fullHistoryJob.items = combined.items
+      fullHistoryJob.stockIndexFile = combined.index.filePath
+      fullHistoryJob.indexStartDate = combined.index.startDate
+      fullHistoryJob.indexEndDate = combined.index.endDate
+      fullHistoryJob.indexedStockCount = combined.index.rowsByCode.size
+      fullHistoryJob.missingStockCount = combined.items.filter(item => item.status === 'pending').length
+      if (fullHistoryJob.status === 'idle') {
+        fullHistoryJob.status = 'ready'
+        fullHistoryJob.message = `已合并快照清单与股票数据索引，共 ${combined.items.length} 只股票`
+      }
+    }
     return buildFullHistorySnapshot()
+  },
+  getFullMarketHistoryPaths() {
+    ensureFullHistoryDir()
+    return {
+      dataDir: FULL_HISTORY_DATA_DIR,
+      dailyDir: FULL_HISTORY_DAILY_DATA_DIR,
+      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+      dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
+      snapshotExecutable: FULL_HISTORY_SNAPSHOT_EXECUTABLE,
+      snapshotCommand: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} --output ${FULL_HISTORY_STOCK_LIST_NAME} --source baostock`,
+      historyExecutable: FULL_HISTORY_EXECUTABLE,
+      historyCommand: buildFullHistoryCommand('', ''),
+      calculateStockListFile: FULL_HISTORY_CALCULATE_STOCK_LIST_FILE,
+      outputDir: FULL_HISTORY_OUTPUT_DIR,
+      stockIndexFile: resolveFullHistoryStockIndexFile()
+    }
   },
   getRuntimeInfo() {
     return {
