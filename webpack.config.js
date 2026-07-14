@@ -16,6 +16,11 @@ module.exports = [
     externals: {
       electron: 'commonjs electron'
     },
+    plugins: [
+      new CopyWebpackPlugin({
+        patterns: [{ from: 'node_modules/sql.js/dist/sql-asm.js', to: 'sql-asm.js' }]
+      })
+    ],
     module: {
       rules: [
         {

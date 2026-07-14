@@ -1,25 +1,10 @@
 import { marketSnapshot, sectorRows, stockUniverse } from './sampleData'
 import { LEGACY_STORAGE_KEYS, STORAGE_KEYS, readStoredValue, writeStoredValue } from './storage'
 
-// 数据源默认配置：页面会在此基础上合并用户保存过的设置。
+// SQLite 重算只需要日期范围；旧版数据源字段不再参与配置读取和持久化。
 export const DEFAULT_DATA_CONFIG = {
-  source: 'sample',
-  provider: 'quantapi-http',
-  refreshToken: '',
-  pythonPath: 'python',
-  codes: '',
   startDate: '',
-  endDate: '',
-  dailyIndicators: 'open,high,low,close,volume,amount,changeRatio,turnoverRate',
-  realtimeIndicators: 'latest,open,high,low,changeRatio,amount,volume,turnoverRate',
-  autoRefresh: false,
-  refreshIntervalMinutes: 30,
-  useRealtime: true,
-  freeHistoryLimit: 80,
-  freeHistoryWindowDays: 30,
-  eastmoneyAdjust: '1',
-  akshareAdjust: 'qfq',
-  stockMetaText: ''
+  endDate: ''
 }
 
 const ONE_DAY = 24 * 60 * 60 * 1000
@@ -45,13 +30,9 @@ export function createSampleDataBundle() {
 export function loadDataConfig() {
   try {
     const saved = readStoredValue(STORAGE_KEYS.dataConfig, {}, [LEGACY_STORAGE_KEYS.dataConfig])
-    const merged = {
-      ...DEFAULT_DATA_CONFIG,
-      ...(saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {})
-    }
     return {
-      ...merged,
-      freeHistoryWindowDays: Math.min(30, Math.max(1, Number(merged.freeHistoryWindowDays) || 30))
+      startDate: String(saved?.startDate || ''),
+      endDate: String(saved?.endDate || '')
     }
   } catch {
     return { ...DEFAULT_DATA_CONFIG }
@@ -60,8 +41,8 @@ export function loadDataConfig() {
 
 export function saveDataConfig(config) {
   writeStoredValue(STORAGE_KEYS.dataConfig, {
-    ...config,
-    freeHistoryWindowDays: Math.min(30, Math.max(1, Number(config?.freeHistoryWindowDays) || 30))
+    startDate: String(config?.startDate || ''),
+    endDate: String(config?.endDate || '')
   })
 }
 

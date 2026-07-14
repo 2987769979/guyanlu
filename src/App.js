@@ -161,7 +161,15 @@ const ALL_MARKET_HISTORY_ENHANCE_LIMIT = 120
 const ALL_MARKET_HISTORY_ENHANCE_TIMEOUT_MS = 90000
 const FULL_HISTORY_DEFAULT_DELAY_MS = 1500
 const FULL_HISTORY_DEFAULT_CONCURRENCY = 5
-const HISTORY_SYNC_ACTIVE_STATUSES = new Set(['preparing', 'running', 'stopping'])
+const HISTORY_SYNC_ACTIVE_STATUSES = new Set(['preparing', 'running', 'daily_snapshot_running', 'stopping'])
+const HISTORY_SECURITY_TYPE_OPTIONS = [
+  { value: 'all', label: '全部类型' },
+  { value: 'a_stock', label: 'A股' },
+  { value: 'index', label: '指数' },
+  { value: 'etf', label: 'ETF' },
+  { value: 'bond', label: '债券' },
+  { value: 'new_bond', label: '新债' }
+]
 const EMPTY_HISTORY_SYNC_STATE = {
   status: 'idle',
   message: '',
@@ -172,6 +180,7 @@ const EMPTY_HISTORY_SYNC_STATE = {
   progress: 0,
   concurrency: FULL_HISTORY_DEFAULT_CONCURRENCY,
   failedTaskCount: 0,
+  databaseFile: '',
   stockListFile: '',
   calculateStockListFile: '',
   stockIndexFile: '',
@@ -180,6 +189,9 @@ const EMPTY_HISTORY_SYNC_STATE = {
   outputDir: '',
   processId: null,
   requiresCleanup: false,
+  hasDateOverlap: false,
+  overlapReason: '',
+  overlapRanges: [],
   dateIndexFile: '',
   dailyDir: '',
   dailyFiles: [],
@@ -190,6 +202,17 @@ const EMPTY_HISTORY_SYNC_STATE = {
 }
 const PORTFOLIO_QUOTE_REFRESH_MS = 15000
 const SHARE_LOT_SIZE = 100
+
+function localDateValue(date = new Date()) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function historySecurityTypeLabel(value) {
+  return HISTORY_SECURITY_TYPE_OPTIONS.find(item => item.value === value)?.label || '债券'
+}
 
 const cloneStrategy = () => JSON.parse(JSON.stringify(DEFAULT_STRATEGY))
 
@@ -619,10 +642,11 @@ export default function App() {
   const [historySync, setHistorySync] = useState(EMPTY_HISTORY_SYNC_STATE)
   const [historySyncBusy, setHistorySyncBusy] = useState(false)
   const [historySyncAction, setHistorySyncAction] = useState(null)
-  const [historyCleanupRequest, setHistoryCleanupRequest] = useState(null)
+  const [historyOverlapRequest, setHistoryOverlapRequest] = useState(null)
   const [historySyncForm, setHistorySyncForm] = useState(() => ({
     startDate: initialAppState.dataConfig.startDate,
     endDate: initialAppState.dataConfig.endDate,
+    snapshotDate: localDateValue(),
     delayMs: FULL_HISTORY_DEFAULT_DELAY_MS,
     concurrency: FULL_HISTORY_DEFAULT_CONCURRENCY,
     adjust: initialAppState.dataConfig.eastmoneyAdjust || '1'
@@ -647,7 +671,7 @@ export default function App() {
   })
   const [transactions, setTransactions] = useState(() => loadJsonArray(STORAGE_KEYS.transactions))
   const [positionPrefill, setPositionPrefill] = useState(null)
-  const [statusInfo, setStatusInfo] = useState(() => createStatus(DATA_SOURCE_STATUS[dataConfig.source] || '数据源待配置'))
+  const [statusInfo, setStatusInfo] = useState(() => createStatus('等待从本地 SQLite 计算'))
   const status = statusInfo.message
   const updateStatus = (value, detail = '') => setStatusInfo(createStatus(value, detail))
   const setStatus = updateStatus
@@ -877,7 +901,7 @@ export default function App() {
     try {
       const snapshot = await bridge.getFullMarketHistorySyncStatus()
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
-      if (!options.silent && snapshot?.message) setStatus(snapshot.message, snapshot.stockIndexFile || snapshot.outputDir || snapshot.message)
+      if (!options.silent && snapshot?.message) setStatus(snapshot.message, snapshot.databaseFile || snapshot.message)
       return snapshot
     } catch (error) {
       if (!options.silent) setStatus(error.message || '读取历史同步状态失败', errorDetail(error, '读取历史同步状态失败'))
@@ -917,7 +941,7 @@ export default function App() {
       setHistorySyncAction({
         type: 'snapshot',
         label: '正在刷新快照清单',
-        detail: historySync.snapshotCommand || 'fetch_all_a_stocks_v2.exe --output all-market-stocks.json --source baostock',
+        detail: historySync.snapshotCommand || 'fetch_all_a_stocks_v2.exe --database "stock-review.db" --source baostock',
         startedAt: Date.now()
       })
       setHistorySync(current => ({
@@ -934,10 +958,58 @@ export default function App() {
       const message = snapshot?.message || `${actionText}全市场股票清单：${snapshot?.snapshotStockCount || snapshot?.total || 0} 只`
       setStatus(
         message,
-        snapshot?.stockListFile || snapshot?.error || ''
+        snapshot?.databaseFile || snapshot?.error || ''
       )
     } catch (error) {
       setStatus(error.message || '刷新全市场股票清单失败', errorDetail(error, '刷新全市场股票清单失败'))
+    } finally {
+      setHistorySyncBusy(false)
+      setHistorySyncAction(null)
+    }
+  }
+
+  async function handleFetchFullMarketDailySnapshot() {
+    const bridge = window.stockReviewBridge
+    if (!bridge?.fetchFullMarketDailySnapshot) {
+      setStatus('当前环境不支持每日快照入库，请在 uTools/Electron 中运行')
+      return
+    }
+    const snapshotDate = historySyncForm.snapshotDate || localDateValue()
+    try {
+      setHistorySyncBusy(true)
+      setHistorySyncAction({
+        type: 'dailySnapshot',
+        label: `正在获取 ${snapshotDate} 每日快照`,
+        detail: historySync.dailySnapshotCommand || `fetch_all_a_stocks_v3.exe --database "stock-review.db" --date ${snapshotDate} --source auto`,
+        startedAt: Date.now()
+      })
+      setHistorySync(current => ({
+        ...current,
+        status: 'daily_snapshot_running',
+        message: `正在获取 ${snapshotDate} 每日快照并写入 SQLite...`
+      }))
+      setStatus(`正在获取 ${snapshotDate} 每日快照...`, '同日已有数据会在写入事务中先删除再重新添加')
+      const snapshot = await bridge.fetchFullMarketDailySnapshot({ date: snapshotDate, source: 'auto' })
+      setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
+      if (snapshot?.dailySnapshotCancelled) {
+        setStatus(snapshot.message || `已停止获取 ${snapshotDate} 每日快照`)
+        return
+      }
+      const result = snapshot?.dailySnapshotResult || {}
+      setStatus(
+        result.message || `${snapshotDate} 每日快照已写入 SQLite`,
+        [
+          result.source ? `数据源 ${result.source}` : '',
+          result.requestedCount ? `候选 ${result.requestedCount} 只` : '',
+          `写入 ${result.fetchedCount || 0} 条`,
+          `替换 ${result.replacedCount || 0} 条`,
+          result.skippedSuspendedCount ? `停牌跳过 ${result.skippedSuspendedCount} 只` : '',
+          result.failedCount ? `失败 ${result.failedCount} 只` : '',
+          snapshot?.databaseFile || ''
+        ].filter(Boolean).join('；')
+      )
+    } catch (error) {
+      setStatus(error.message || '每日快照入库失败', errorDetail(error, '每日快照入库失败'))
     } finally {
       setHistorySyncBusy(false)
       setHistorySyncAction(null)
@@ -996,29 +1068,10 @@ export default function App() {
         endDate: historySyncForm.endDate
       })
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
-      setHistoryCleanupRequest(snapshot?.requiresCleanup ? snapshot : null)
-      setStatus(snapshot?.message || '全市场历史数据同步已开始', snapshot?.stockIndexFile || snapshot?.outputDir || snapshot?.historyExecutable || '')
+      setHistoryOverlapRequest(snapshot?.hasDateOverlap ? snapshot : null)
+      setStatus(snapshot?.message || '全市场历史数据同步已开始', snapshot?.databaseFile || snapshot?.historyExecutable || '')
     } catch (error) {
       setStatus(error.message || '启动全市场历史数据同步失败', errorDetail(error, '启动全市场历史数据同步失败'))
-    } finally {
-      setHistorySyncBusy(false)
-    }
-  }
-
-  async function handleConfirmHistoryCleanup() {
-    const bridge = window.stockReviewBridge
-    if (!bridge?.cleanupFullMarketHistoryExecutableData) {
-      setStatus('当前环境不支持清理历史数据，请在 uTools/Electron 中运行')
-      return
-    }
-    try {
-      setHistorySyncBusy(true)
-      const snapshot = await bridge.cleanupFullMarketHistoryExecutableData()
-      setHistoryCleanupRequest(null)
-      setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
-      setStatus(snapshot?.message || '旧历史数据已清理', (snapshot?.removedPaths || []).join('\n'))
-    } catch (error) {
-      setStatus(error.message || '清理旧历史数据失败', errorDetail(error, '清理旧历史数据失败'))
     } finally {
       setHistorySyncBusy(false)
     }
@@ -1030,14 +1083,81 @@ export default function App() {
     try {
       const snapshot = await bridge.cancelFullMarketHistorySync()
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
-      setStatus(snapshot?.message || '正在停止全市场历史数据同步')
+      setStatus(snapshot?.message || '正在停止当前数据任务')
     } catch (error) {
-      setStatus(error.message || '停止全市场历史数据同步失败', errorDetail(error, '停止全市场历史数据同步失败'))
+      setStatus(error.message || '停止当前数据任务失败', errorDetail(error, '停止当前数据任务失败'))
     }
   }
 
-  // 根据当前数据源配置调度不同桥接接口，并统一转换成应用内部数据包。
+  // 顶部刷新与策略页运行都只读取本地 SQLite，按日期过滤后计算并持久化到 uTools。
   const handleRefreshData = async (nextConfig = dataConfig, options = {}) => {
+    const startDate = String(nextConfig?.startDate || '').trim()
+    const endDate = String(nextConfig?.endDate || '').trim()
+    if (!startDate || !endDate) {
+      setStatus('请先在策略配置页选择开始日期和结束日期')
+      setActivePage('strategy')
+      return
+    }
+    if (startDate > endDate) {
+      setStatus('开始日期不能晚于结束日期')
+      setActivePage('strategy')
+      return
+    }
+
+    const bridge = window.stockReviewBridge
+    if (!bridge?.readStockHistoryFromSqlite) {
+      setStatus('当前环境不支持读取本地 SQLite，请在 uTools/Electron 中运行')
+      return
+    }
+
+    try {
+      setIsRefreshing(true)
+      if (!options.silent) setStatus(`正在读取 SQLite 并计算 ${startDate} 至 ${endDate} 的 A 股数据...`)
+      const result = await bridge.readStockHistoryFromSqlite({ startDate, endDate })
+      const bundle = buildDataBundleFromIfindRows({
+        rows: Array.isArray(result?.rows) ? result.rows : [],
+        config: { sourceLabel: '本地 SQLite 数据库' },
+        fetchedAt: result?.readAt || new Date().toISOString()
+      })
+      if (!bundle.stocks.length) throw new Error('所选日期范围内没有可计算的 A 股数据')
+
+      const calculatedStocks = enrichStocks(bundle.stocks, bundle.sectors, bundle.market, strategy)
+      const nextBundle = {
+        ...bundle,
+        stocks: calculatedStocks,
+        sourceLabel: '本地 SQLite 数据库',
+        allMarketMode: true,
+        historyMode: bundle.historyMode,
+        historyScope: bundle.stocks.filter(stock => stock.historyDays >= 20).length,
+        historyEnhanceError: null,
+        supportsBacktest: false,
+        sourceSize: calculatedStocks.length,
+        resultLimit: ALL_MARKET_TOP_LIMIT,
+        calculationRange: { startDate, endDate },
+        databaseFile: result.databaseFile || ''
+      }
+      if (!replaceLatestDataBundle(nextBundle)) throw new Error('计算完成，但结果写入本地存储失败')
+      setDataBundle(nextBundle)
+      if (calculatedStocks[0]) setSelectedStockCode(calculatedStocks[0].code)
+
+      const storageLabel = window.utools?.dbStorage ? 'uTools dbStorage' : '浏览器 localStorage'
+      const finalStatus = `SQLite 计算完成：${calculatedStocks.length} 只 A 股，结果已写入 ${storageLabel}`
+      setStatus(finalStatus, [
+        finalStatus,
+        `日期范围：${startDate} 至 ${endDate}`,
+        `读取日 K：${Number(result.rowCount) || 0} 条（每只股票最多 ${Number(result.maxBarsPerStock) || 61} 条）`,
+        `SQLite：${result.databaseFile || ''}`,
+        '过滤规则：仅沪深北 A 股代码，已排除指数、ETF、债券和新债'
+      ].join('\n'))
+    } catch (error) {
+      setStatus(error.message || 'SQLite 计算失败', errorDetail(error, 'SQLite 计算失败'))
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
+  // 旧的数据源获取逻辑仅保留作历史兼容，不再由页面按钮调用。
+  const handleRefreshDataLegacy = async (nextConfig = dataConfig, options = {}) => {
     if (nextConfig.source === 'sample') {
       clearLatestDataBundle()
       setDataBundle(createSampleDataBundle())
@@ -1585,14 +1705,10 @@ export default function App() {
               onStrategyChange={setStrategy}
               onSave={handleSaveStrategy}
               onReset={handleResetStrategy}
-              onRun={() => {
-                setStatus('已按当前参数重新计算股票池')
-                handleRefreshData(dataConfig)
-              }}
+              onRun={() => handleRefreshData(dataConfig)}
               dataConfig={dataConfig}
               onDataConfigChange={setDataConfig}
               onRefreshData={() => handleRefreshData(dataConfig)}
-              onTestConnection={handleTestConnection}
               isRefreshing={isRefreshing}
               dataBundle={dataBundle}
             />
@@ -1607,12 +1723,12 @@ export default function App() {
               action={historySyncAction}
               onPrepareList={() => handlePrepareFullHistoryList(true)}
               onRefreshStockList={handleRefreshFullMarketStockSnapshot}
+              onFetchDailySnapshot={handleFetchFullMarketDailySnapshot}
               onStart={handleStartFullHistorySync}
               onStop={handleStopFullHistorySync}
               onRefresh={() => refreshFullHistoryStatus()}
-              cleanupRequest={historyCleanupRequest}
-              onConfirmCleanup={handleConfirmHistoryCleanup}
-              onCancelCleanup={() => setHistoryCleanupRequest(null)}
+              overlapRequest={historyOverlapRequest}
+              onDismissOverlap={() => setHistoryOverlapRequest(null)}
             />
           )}
           {activePage === 'backtest' && (
@@ -1673,7 +1789,7 @@ function HeaderBar({ status, statusDetail, isRefreshing, onRefresh, onCopyReview
             )
           }}
         />
-        <Tooltip title='手动更新数据'>
+        <Tooltip title='按策略日期从 SQLite 重新计算'>
           <span>
             <IconButton color='primary' onClick={onRefresh} disabled={isRefreshing}>
               <SyncIcon className={isRefreshing ? 'spin-icon' : ''} />
@@ -2097,7 +2213,6 @@ function StrategyPage({
   dataConfig,
   onDataConfigChange,
   onRefreshData,
-  onTestConnection,
   isRefreshing,
   dataBundle
 }) {
@@ -2125,7 +2240,7 @@ function StrategyPage({
         title='策略配置页'
         action={(
           <Stack direction='row' spacing={1}>
-            <Button startIcon={<PlayArrowIcon />} variant='contained' onClick={onRun} disabled={isRefreshing}>运行筛选</Button>
+            <Button startIcon={<PlayArrowIcon />} variant='contained' onClick={onRun} disabled={isRefreshing}>运行计算</Button>
             <Button startIcon={<SaveIcon />} variant='outlined' onClick={onSave}>保存版本</Button>
             <Tooltip title='恢复默认'>
               <IconButton onClick={onReset}><RestartAltIcon /></IconButton>
@@ -2137,57 +2252,14 @@ function StrategyPage({
       <Paper className='panel' variant='outlined'>
         <Box className='panel-head'>
           <Box>
-            <Typography variant='subtitle2' fontWeight={800}>数据源接入</Typography>
+            <Typography variant='subtitle2' fontWeight={800}>SQLite 计算范围</Typography>
             <Typography variant='caption' color='text.secondary'>
-              支持免费稳定模式、同花顺 QuantAPI、东方财富公开接口和 AKShare；可手动更新，也可按频率自动刷新。
+              仅按开始日期和结束日期读取本地数据库；计算过程不会请求任何行情接口。
             </Typography>
           </Box>
           <Chip size='small' label={`${dataBundle.sourceLabel}${scopeLabel}${dataBundle.updatedAt ? ` · ${dataBundle.updatedAt.slice(0, 19).replace('T', ' ')}` : ''}`} variant='outlined' />
         </Box>
         <Box className='data-source-grid'>
-          <FormControl size='small'>
-            <InputLabel>数据源</InputLabel>
-            <Select label='数据源' value={dataConfig.source} onChange={event => setDataValue('source', event.target.value)}>
-              <MenuItem value='sample'>本地样例数据</MenuItem>
-              <MenuItem value='quantapi'>同花顺 QuantAPI</MenuItem>
-              <MenuItem value='eastmoney'>东方财富公开接口</MenuItem>
-              <MenuItem value='free'>免费稳定模式</MenuItem>
-              <MenuItem value='akshare'>AKShare</MenuItem>
-            </Select>
-          </FormControl>
-          <TextField
-            size='small'
-            label='refresh_token'
-            type='password'
-            value={dataConfig.refreshToken}
-            onChange={event => setDataValue('refreshToken', event.target.value)}
-            disabled={dataConfig.source !== 'quantapi'}
-          />
-          <TextField
-            size='small'
-            label='Python 路径'
-            value={dataConfig.pythonPath}
-            onChange={event => setDataValue('pythonPath', event.target.value)}
-            disabled={dataConfig.source !== 'akshare' && dataConfig.source !== 'free'}
-          />
-          <TextField
-            size='small'
-            label='免费模式历史股票数'
-            type='number'
-            value={dataConfig.freeHistoryLimit}
-            onChange={event => setDataValue('freeHistoryLimit', Number(event.target.value))}
-            inputProps={{ min: 1, max: 1200 }}
-            disabled={dataConfig.source !== 'free'}
-          />
-          <TextField
-            size='small'
-            label='免费模式窗口天数'
-            type='number'
-            value={dataConfig.freeHistoryWindowDays}
-            onChange={event => setDataValue('freeHistoryWindowDays', Number(event.target.value))}
-            inputProps={{ min: 1, max: 30 }}
-            disabled={dataConfig.source !== 'free'}
-          />
           <TextField
             size='small'
             label='开始日期'
@@ -2204,101 +2276,13 @@ function StrategyPage({
             onChange={event => setDataValue('endDate', event.target.value)}
             InputLabelProps={{ shrink: true }}
           />
-          <TextField
-            size='small'
-            label='刷新间隔（分钟）'
-            type='number'
-            value={dataConfig.refreshIntervalMinutes}
-            onChange={event => setDataValue('refreshIntervalMinutes', Number(event.target.value))}
-            inputProps={{ min: 1 }}
-          />
-          <FormControlLabel
-            control={
-              <Switch
-                checked={Boolean(dataConfig.autoRefresh)}
-                onChange={event => setDataValue('autoRefresh', event.target.checked)}
-                disabled={dataConfig.source === 'sample'}
-              />
-            }
-            label='自动刷新'
-          />
-          <FormControlLabel
-            control={
-              <Switch
-                checked={Boolean(dataConfig.useRealtime)}
-                onChange={event => setDataValue('useRealtime', event.target.checked)}
-                disabled={dataConfig.source === 'sample'}
-              />
-            }
-            label='叠加实时快照'
-          />
-          <FormControl size='small'>
-            <InputLabel>东方财富复权</InputLabel>
-            <Select
-              label='东方财富复权'
-              value={dataConfig.eastmoneyAdjust}
-              onChange={event => setDataValue('eastmoneyAdjust', event.target.value)}
-              disabled={dataConfig.source !== 'eastmoney'}
-            >
-              <MenuItem value='0'>不复权</MenuItem>
-              <MenuItem value='1'>前复权</MenuItem>
-              <MenuItem value='2'>后复权</MenuItem>
-            </Select>
-          </FormControl>
-          <FormControl size='small'>
-            <InputLabel>AKShare 复权</InputLabel>
-            <Select
-              label='AKShare 复权'
-              value={dataConfig.akshareAdjust}
-              onChange={event => setDataValue('akshareAdjust', event.target.value)}
-              disabled={dataConfig.source !== 'akshare'}
-            >
-              <MenuItem value=''>不复权</MenuItem>
-              <MenuItem value='qfq'>前复权</MenuItem>
-              <MenuItem value='hfq'>后复权</MenuItem>
-            </Select>
-          </FormControl>
-        </Box>
-        <TextField
-          label='股票代码池'
-          value={dataConfig.codes}
-          onChange={event => setDataValue('codes', event.target.value)}
-          fullWidth
-          multiline
-          minRows={2}
-          margin='normal'
-          placeholder='留空=全市场；或输入 000001.SZ,600000.SH'
-          helperText={`股票代码池留空时会读取全市场快照；免费稳定模式会为成交额靠前 ${dataConfig.freeHistoryLimit || 80} 只补充历史K线，其余股票用快照指标参与评分。`}
-        />
-        <Box className='content-grid two-columns'>
-          <TextField
-            label='日线指标'
-            value={dataConfig.dailyIndicators}
-            onChange={event => setDataValue('dailyIndicators', event.target.value)}
-            fullWidth
-            size='small'
-            helperText='默认按 QuantAPI 历史行情字段解析：open, high, low, close, volume, amount, changeRatio'
-          />
-          <TextField
-            label='名称/板块映射（可选）'
-            value={dataConfig.stockMetaText}
-            onChange={event => setDataValue('stockMetaText', event.target.value)}
-            fullWidth
-            multiline
-            minRows={2}
-            placeholder='300750.SZ,宁德时代,电池,新能源车'
-            helperText='每行：代码,名称,行业,概念；不填时会用代码作为名称。'
-          />
         </Box>
         <Stack direction='row' spacing={1} mt={2} flexWrap='wrap' useFlexGap>
           <Button startIcon={<SyncIcon />} variant='contained' onClick={onRefreshData} disabled={isRefreshing}>
-            {isRefreshing ? '更新中' : '手动更新'}
+            {isRefreshing ? '计算中' : '从 SQLite 计算'}
           </Button>
-          <Button variant='outlined' onClick={onTestConnection} disabled={isRefreshing}>
-            测试数据源
-          </Button>
-            <Alert severity='info' sx={{ py: 0, alignItems: 'center' }}>
-            同花顺需要 refresh_token；免费稳定模式需要本机 Python 已安装 akshare 和 baostock；东方财富公开接口无需 token。
+          <Alert severity='info' sx={{ py: 0, alignItems: 'center' }}>
+            仅计算沪深北 A 股；指数、ETF、债券和新债会在 SQLite 查询阶段被排除，结果保存到 uTools。
           </Alert>
         </Stack>
       </Paper>
@@ -2375,12 +2359,12 @@ function HistorySyncPage({
   action,
   onPrepareList,
   onRefreshStockList,
+  onFetchDailySnapshot,
   onStart,
   onStop,
   onRefresh,
-  cleanupRequest,
-  onConfirmCleanup,
-  onCancelCleanup
+  overlapRequest,
+  onDismissOverlap
 }) {
   const rows = Array.isArray(state.items) ? state.items : []
   const fixedPaths = useMemo(() => {
@@ -2391,21 +2375,21 @@ function HistorySyncPage({
     }
   }, [])
   const dataDir = state.dataDir || fixedPaths.dataDir || ''
-  const stockListFile = state.stockListFile || fixedPaths.stockListFile || ''
+  const databaseFile = state.databaseFile || fixedPaths.databaseFile || ''
   const snapshotExecutable = state.snapshotExecutable || fixedPaths.snapshotExecutable || ''
-  const snapshotCommand = state.snapshotCommand || fixedPaths.snapshotCommand || 'fetch_all_a_stocks_v2.exe --output all-market-stocks.json --source baostock'
+  const snapshotCommand = state.snapshotCommand || fixedPaths.snapshotCommand || 'fetch_all_a_stocks_v2.exe --database "stock-review.db" --source baostock'
+  const dailySnapshotExecutable = state.dailySnapshotExecutable || fixedPaths.dailySnapshotExecutable || ''
+  const dailySnapshotCommand = state.dailySnapshotCommand || fixedPaths.dailySnapshotCommand || 'fetch_all_a_stocks_v3.exe --database "stock-review.db" --date <快照日期> --source auto'
   const historyExecutable = state.historyExecutable || fixedPaths.historyExecutable || ''
-  const calculateStockListFile = state.calculateStockListFile || fixedPaths.calculateStockListFile || ''
-  const historyOutputDir = state.outputDir || fixedPaths.outputDir || ''
-  const stockIndexFile = state.stockIndexFile || fixedPaths.stockIndexFile || ''
   const historyCommand = isActive && state.historyCommand
     ? state.historyCommand
-    : `fetch_a_stock_history_by_stock.exe --start ${form.startDate || '<开始日期>'} --end ${form.endDate || '<结束日期>'} --stock-list-file "all-market-stocks-Calculate.json" --output-dir "all-market-history-by-stock" --source baostock --resume`
+    : `fetch_a_stock_history_by_stock.exe --start ${form.startDate || '<开始日期>'} --end ${form.endDate || '<结束日期>'} --database "stock-review.db" --source baostock --resume`
   const progress = Math.max(0, Math.min(100, Number(state.progress) || 0))
   const setFormValue = (key, value) => onFormChange(current => ({ ...current, [key]: value }))
   const statusMeta = historyJobStatusMeta(state.status)
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
+  const [securityTypeFilter, setSecurityTypeFilter] = useState('all')
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(20)
   const [jumpPage, setJumpPage] = useState('1')
@@ -2413,15 +2397,17 @@ function HistorySyncPage({
   const [actionClock, setActionClock] = useState(Date.now())
   const actionElapsedMs = action?.startedAt ? Math.max(0, actionClock - action.startedAt) : 0
   const isSnapshotRefreshing = action?.type === 'snapshot'
+  const isDailySnapshotFetching = action?.type === 'dailySnapshot'
 
   const filteredRows = useMemo(() => {
     const keyword = query.trim().toLowerCase()
     return rows.filter(row => {
       const statusOk = statusFilter === 'all' || row.status === statusFilter
+      const securityTypeOk = securityTypeFilter === 'all' || row.securityType === securityTypeFilter
       const keywordOk = !keyword || [row.code, row.name].some(value => String(value || '').toLowerCase().includes(keyword))
-      return statusOk && keywordOk
+      return statusOk && securityTypeOk && keywordOk
     })
-  }, [rows, query, statusFilter])
+  }, [rows, query, statusFilter, securityTypeFilter])
   const pageRows = useMemo(() => {
     const start = page * rowsPerPage
     return filteredRows.slice(start, start + rowsPerPage)
@@ -2449,6 +2435,11 @@ function HistorySyncPage({
   }
   const handleStatusFilterChange = event => {
     setStatusFilter(event.target.value)
+    setPage(0)
+    setJumpPage('1')
+  }
+  const handleSecurityTypeFilterChange = event => {
+    setSecurityTypeFilter(event.target.value)
     setPage(0)
     setJumpPage('1')
   }
@@ -2482,6 +2473,15 @@ function HistorySyncPage({
             >
               {isSnapshotRefreshing ? `刷新中 ${formatElapsed(actionElapsedMs)}` : '刷新快照清单'}
             </Button>
+            <Button
+              startIcon={isDailySnapshotFetching ? <SyncIcon className='spin-icon' /> : <AddCircleOutlineIcon />}
+              variant='outlined'
+              color='secondary'
+              onClick={onFetchDailySnapshot}
+              disabled={isBusy || isActive}
+            >
+              {isDailySnapshotFetching ? `获取中 ${formatElapsed(actionElapsedMs)}` : '获取每日快照'}
+            </Button>
             <Button startIcon={<PlayArrowIcon />} variant='contained' onClick={() => onStart()} disabled={isBusy || isActive}>
               开始获取
             </Button>
@@ -2514,6 +2514,17 @@ function HistorySyncPage({
             onChange={event => setFormValue('endDate', event.target.value)}
             InputLabelProps={{ shrink: true }}
             disabled={isActive}
+          />
+          <TextField
+            size='small'
+            type='date'
+            label='快照日期'
+            value={form.snapshotDate || localDateValue()}
+            onChange={event => setFormValue('snapshotDate', event.target.value)}
+            InputLabelProps={{ shrink: true }}
+            inputProps={{ max: localDateValue() }}
+            disabled={isActive}
+            helperText='默认当天，也可指定历史日期'
           />
         </Box>
         <Box className='history-details-head'>
@@ -2559,22 +2570,22 @@ function HistorySyncPage({
               快照程序地址：{snapshotExecutable || '正在读取系统固定地址...'}
             </Typography>
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
-              快照清单地址：{stockListFile || '正在读取系统固定地址...'}
+              SQLite 数据库：{databaseFile || '正在读取系统固定地址...'}
             </Typography>
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
               执行命令：{snapshotCommand}
             </Typography>
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
+              每日快照程序：{dailySnapshotExecutable || '正在读取系统固定地址...'}
+            </Typography>
+            <Typography variant='caption' color='text.secondary' className='full-history-output'>
+              每日快照命令：{dailySnapshotCommand}
+            </Typography>
+            <Typography variant='caption' color='text.secondary' className='full-history-output'>
               历史程序地址：{historyExecutable || '正在读取系统固定地址...'}
             </Typography>
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
-              计算清单地址：{calculateStockListFile || '正在读取系统固定地址...'}
-            </Typography>
-            <Typography variant='caption' color='text.secondary' className='full-history-output'>
-              历史输出目录：{historyOutputDir || '正在读取系统固定地址...'}
-            </Typography>
-            <Typography variant='caption' color='text.secondary' className='full-history-output'>
-              股票数据索引：{stockIndexFile || '正在读取系统固定地址...'}
+              历史数据存储：统一写入上述 SQLite 数据库，不再生成单股 JSON
             </Typography>
             <Typography variant='caption' color='text.secondary' className='full-history-output'>
               历史执行命令：{historyCommand}
@@ -2589,8 +2600,8 @@ function HistorySyncPage({
       </Paper>
 
       <Box className='metric-grid history-metrics'>
-        <MetricCard label='股票总数' value={state.total || rows.length} sub='全市场列表' accent='blue' />
-        <MetricCard label='已获取' value={state.fetched || 0} sub='写入本地文件' accent='green' />
+        <MetricCard label='证券总数' value={state.total || rows.length} sub={`其中 A 股 ${state.historyTotal || 0} 只`} accent='blue' />
+        <MetricCard label='已获取' value={state.fetched || 0} sub='已写入 SQLite' accent='green' />
         <MetricCard label='未获取' value={state.pending || 0} sub='等待队列' accent='cyan' />
         <MetricCard label='无数据' value={state.skipped || 0} sub='停牌/未上市，不补跑' accent='cyan' />
         <MetricCard label='失败' value={state.failed || 0} sub='可稍后重跑' accent='amber' />
@@ -2618,6 +2629,14 @@ function HistorySyncPage({
               }}
             />
             <FormControl size='small' className='history-status-filter'>
+              <InputLabel>证券类型</InputLabel>
+              <Select label='证券类型' value={securityTypeFilter} onChange={handleSecurityTypeFilterChange}>
+                {HISTORY_SECURITY_TYPE_OPTIONS.map(item => (
+                  <MenuItem key={item.value} value={item.value}>{item.label}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+            <FormControl size='small' className='history-status-filter'>
               <InputLabel>状态</InputLabel>
               <Select label='状态' value={statusFilter} onChange={handleStatusFilterChange}>
                 <MenuItem value='all'>全部状态</MenuItem>
@@ -2626,6 +2645,7 @@ function HistorySyncPage({
                 <MenuItem value='done'>已获取</MenuItem>
                 <MenuItem value='skipped'>无数据</MenuItem>
                 <MenuItem value='failed'>失败</MenuItem>
+                <MenuItem value='not_applicable'>不获取</MenuItem>
               </Select>
             </FormControl>
           </Stack>
@@ -2636,6 +2656,7 @@ function HistorySyncPage({
               <TableRow>
                 <TableCell>股票代码</TableCell>
                 <TableCell>股票名称</TableCell>
+                <TableCell>证券类型</TableCell>
                 <TableCell>获取状态</TableCell>
                 <TableCell align='right'>K线条数</TableCell>
                 <TableCell>更新时间</TableCell>
@@ -2647,6 +2668,7 @@ function HistorySyncPage({
                 <TableRow key={row.code} hover selected={row.status === 'running'}>
                   <TableCell><code>{row.code}</code></TableCell>
                   <TableCell>{row.name || row.code}</TableCell>
+                  <TableCell>{historySecurityTypeLabel(row.securityType)}</TableCell>
                   <TableCell><HistoryItemStatusChip status={row.status} /></TableCell>
                   <TableCell align='right'>{row.rowCount || 0}</TableCell>
                   <TableCell>{row.updatedAt ? formatDateTime(row.updatedAt) : '--'}</TableCell>
@@ -2659,7 +2681,7 @@ function HistorySyncPage({
               ))}
               {!pageRows.length && (
                 <TableRow>
-                  <TableCell colSpan={6}>
+                  <TableCell colSpan={7}>
                     <Typography variant='body2' color='text.secondary' textAlign='center' py={3}>
                       {rows.length ? '没有符合条件的股票' : '暂无股票列表'}
                     </Typography>
@@ -2703,27 +2725,21 @@ function HistorySyncPage({
           </Stack>
         </Stack>
       </Paper>
-      <Dialog open={Boolean(cleanupRequest)} onClose={isBusy ? undefined : onCancelCleanup} maxWidth='sm' fullWidth>
-        <DialogTitle>历史数据日期范围不一致</DialogTitle>
+      <Dialog open={Boolean(overlapRequest)} onClose={onDismissOverlap} maxWidth='sm' fullWidth>
+        <DialogTitle>所选日期与已有历史数据重合</DialogTitle>
         <DialogContent>
           <Alert severity='warning' sx={{ mb: 2 }}>
-            {cleanupRequest?.cleanupReason || '已有历史数据与当前页面日期不一致，需要先清理旧数据。'}
+            {overlapRequest?.overlapReason || '所选日期范围包含 SQLite 中已经存在的历史交易日，本次获取未启动。'}
           </Alert>
           <Typography variant='body2' color='text.secondary'>
-            确认后将删除历史输出目录、股票数据索引和计算清单；不会删除快照清单及两个可执行程序。本次操作只执行清理，不会自动重新开始获取。
+            请调整开始日期和结束日期，确保新区间不包含已经存入数据库的交易日。原有历史数据不会被删除或覆盖。
           </Typography>
           <Typography variant='caption' color='text.secondary' className='full-history-output' sx={{ mt: 2 }}>
-            历史输出目录：{cleanupRequest?.outputDir || historyOutputDir}
-          </Typography>
-          <Typography variant='caption' color='text.secondary' className='full-history-output'>
-            股票数据索引：{cleanupRequest?.stockIndexFile || stockIndexFile}
+            SQLite 数据库：{overlapRequest?.databaseFile || databaseFile}
           </Typography>
         </DialogContent>
         <DialogActions>
-          <Button onClick={onCancelCleanup} disabled={isBusy}>取消</Button>
-          <Button color='error' variant='contained' onClick={onConfirmCleanup} disabled={isBusy}>
-            {isBusy ? '正在清理...' : '确认删除旧数据'}
-          </Button>
+          <Button variant='contained' onClick={onDismissOverlap}>知道了</Button>
         </DialogActions>
       </Dialog>
     </Box>
@@ -2736,9 +2752,10 @@ function historyJobStatusMeta(status) {
     preparing: { label: '加载列表', color: 'primary' },
     ready: { label: '待开始', color: 'primary' },
     running: { label: '获取中', color: 'warning' },
+    daily_snapshot_running: { label: '快照获取中', color: 'warning' },
     stopping: { label: '停止中', color: 'warning' },
     stopped: { label: '已停止', color: 'default' },
-    cleanup_required: { label: '待清理旧数据', color: 'warning' },
+    date_overlap: { label: '日期有重合', color: 'warning' },
     completed: { label: '已完成', color: 'success' },
     failed: { label: '失败', color: 'error' }
   }[status] || { label: status || '未知', color: 'default' }
@@ -2750,7 +2767,8 @@ function HistoryItemStatusChip({ status }) {
     running: { label: '获取中', color: 'warning' },
     done: { label: '已获取', color: 'success' },
     skipped: { label: '无数据', color: 'info' },
-    failed: { label: '失败', color: 'error' }
+    failed: { label: '失败', color: 'error' },
+    not_applicable: { label: '不获取', color: 'default' }
   }[status] || { label: status || '未获取', color: 'default' }
 
   return <Chip size='small' label={meta.label} color={meta.color} variant='outlined' />

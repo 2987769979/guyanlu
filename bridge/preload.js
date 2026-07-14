@@ -10,6 +10,7 @@ const http = require('http')
 const https = require('https')
 const os = require('os')
 const path = require('path')
+const { TextDecoder } = require('util')
 
 const IFIND_API_BASE = 'https://quantapi.51ifind.com/api/v1'
 const EASTMONEY_UT = '7eea3edcaed734bea9cbfc24409ed989'
@@ -94,11 +95,15 @@ const STOCK_REVIEW_SYSTEM_DATA_DIR = process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, '股研录')
   : path.join(os.homedir(), '.stock-review')
 const FULL_HISTORY_DATA_DIR = path.join(STOCK_REVIEW_SYSTEM_DATA_DIR, 'history-data')
+const STOCK_REVIEW_DATABASE_NAME = 'stock-review.db'
+const STOCK_REVIEW_DATABASE_FILE = path.join(FULL_HISTORY_DATA_DIR, STOCK_REVIEW_DATABASE_NAME)
 const FULL_HISTORY_DAILY_DATA_DIR = path.join(FULL_HISTORY_DATA_DIR, 'daily')
 const FULL_HISTORY_STOCK_LIST_NAME = 'all-market-stocks.json'
 const FULL_HISTORY_STOCK_LIST_FILE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_STOCK_LIST_NAME)
 const FULL_HISTORY_DATE_INDEX_FILE = path.join(FULL_HISTORY_DATA_DIR, 'all-market-history-date-index.json')
 const FULL_HISTORY_SNAPSHOT_EXECUTABLE = path.join(FULL_HISTORY_DATA_DIR, 'fetch_all_a_stocks_v2.exe')
+const FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME = 'fetch_all_a_stocks_v3.exe'
+const FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME)
 const FULL_HISTORY_EXECUTABLE_NAME = 'fetch_a_stock_history_by_stock.exe'
 const FULL_HISTORY_EXECUTABLE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_EXECUTABLE_NAME)
 const FULL_HISTORY_CALCULATE_STOCK_LIST_NAME = 'all-market-stocks-Calculate.json'
@@ -133,9 +138,12 @@ let eastmoneyAllSpotCache = {
 }
 let fullHistoryJob = createFullHistoryJob({ status: 'idle', message: '尚未开始全市场历史同步' })
 let fullHistoryProcess = null
+let fullDailySnapshotProcess = null
+let fullDailySnapshotCancelRequested = false
 const DESKTOP_WINDOW_BASE_URL = 'index.html'
 const DESKTOP_WINDOW_FEATURE_CODES = new Set(['stock-review', 'stock-pool', 'risk-watch'])
 let stockReviewDesktopWindow = null
+let sqlJsRuntimePromise = null
 let lastDesktopWindowUrl = ''
 
 // 判断当前是否已经在独立桌面窗口中，避免启动入口递归创建新窗口。
@@ -1713,7 +1721,11 @@ function runPythonJson({ pythonPath, script, input, timeout = 120000, label = 'P
   return new Promise((resolve, reject) => {
     const child = spawn(pythonPath || 'python', ['-c', script], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: 'utf-8'
+      }
     })
     const stdout = []
     const stderr = []
@@ -1742,7 +1754,7 @@ function runPythonJson({ pythonPath, script, input, timeout = 120000, label = 'P
         reject(new Error(`${label} 返回非JSON内容：${outText.slice(0, 240)} ${errText.slice(0, 240)}`))
       }
     })
-    child.stdin.write(JSON.stringify(input || {}))
+    child.stdin.write(Buffer.from(JSON.stringify(input || {}), 'utf8'))
     child.stdin.end()
   })
 }
@@ -2594,7 +2606,7 @@ async function fetchFreeStableData(options = {}) {
 }
 
 function isFullHistoryActive(job = fullHistoryJob) {
-  return ['preparing', 'running', 'stopping'].includes(job?.status)
+  return ['preparing', 'running', 'daily_snapshot_running', 'stopping'].includes(job?.status)
 }
 
 function clampFullHistoryDelay(value) {
@@ -2610,6 +2622,28 @@ function normalizeFullHistoryDate(value) {
   return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`
 }
 
+function isFullHistoryAStock(item) {
+  const code = normalizeCacheCode(item?.code || item?.thscode || '')
+  const [symbol = '', market = ''] = code.split('.')
+  if (market === 'SH') return STOCK_LIST_SH_PREFIXES.some(prefix => symbol.startsWith(prefix))
+  if (market === 'SZ') return STOCK_LIST_SZ_PREFIXES.some(prefix => symbol.startsWith(prefix))
+  if (market === 'BJ') return STOCK_LIST_BJ_PREFIXES.some(prefix => symbol.startsWith(prefix))
+  return false
+}
+
+// 股票清单保留全证券类型供页面查询；历史程序只会处理 isFullHistoryAStock 为真的项目。
+function inferFullHistorySecurityType(item) {
+  const code = normalizeCacheCode(item?.code || item?.thscode || '')
+  const [symbol = '', market = ''] = code.split('.')
+  const name = decodeLegacyStockName(item?.name || item?.stockName || '').toLowerCase()
+
+  if (isFullHistoryAStock({ code })) return 'a_stock'
+  if (/新债|发债/.test(name) || /^(70|71|72|73|75|78|370|371|372)/.test(symbol)) return 'new_bond'
+  if (/etf|交易型开放式/.test(name) || (market === 'SH' && /^(51|56|58)/.test(symbol)) || (market === 'SZ' && symbol.startsWith('159'))) return 'etf'
+  if (/指数/.test(name) || (market === 'SH' && symbol.startsWith('000')) || (market === 'SZ' && symbol.startsWith('399')) || (market === 'BJ' && symbol.startsWith('899'))) return 'index'
+  return 'bond'
+}
+
 function resolveFullHistoryStockIndexFile() {
   if (fs.existsSync(FULL_HISTORY_STOCK_INDEX_FILE)) return FULL_HISTORY_STOCK_INDEX_FILE
   if (fs.existsSync(FULL_HISTORY_ROOT_STOCK_INDEX_FILE)) return FULL_HISTORY_ROOT_STOCK_INDEX_FILE
@@ -2620,8 +2654,7 @@ function buildFullHistoryArgs(startDate, endDate) {
   return [
     '--start', normalizeFullHistoryDate(startDate),
     '--end', normalizeFullHistoryDate(endDate),
-    '--stock-list-file', FULL_HISTORY_CALCULATE_STOCK_LIST_NAME,
-    '--output-dir', FULL_HISTORY_OUTPUT_DIR_NAME,
+    '--database', STOCK_REVIEW_DATABASE_NAME,
     '--source', 'baostock',
     '--resume'
   ]
@@ -2635,7 +2668,7 @@ function quoteCommandArgument(value) {
 function buildFullHistoryCommand(startDate, endDate) {
   const start = normalizeFullHistoryDate(startDate) || '<开始日期>'
   const end = normalizeFullHistoryDate(endDate) || '<结束日期>'
-  return `${FULL_HISTORY_EXECUTABLE_NAME} --start ${quoteCommandArgument(start)} --end ${quoteCommandArgument(end)} --stock-list-file "${FULL_HISTORY_CALCULATE_STOCK_LIST_NAME}" --output-dir "${FULL_HISTORY_OUTPUT_DIR_NAME}" --source baostock --resume`
+  return `${FULL_HISTORY_EXECUTABLE_NAME} --start ${quoteCommandArgument(start)} --end ${quoteCommandArgument(end)} --database "${STOCK_REVIEW_DATABASE_NAME}" --source baostock --resume`
 }
 
 // 创建全市场历史同步任务对象，前端轮询看到的状态都从这里派生。
@@ -2663,6 +2696,7 @@ function createFullHistoryJob(base = {}, items = []) {
     currentName: base.currentName || '',
     nextRequestAt: base.nextRequestAt || null,
     outputFile: base.outputFile || '',
+    databaseFile: base.databaseFile || STOCK_REVIEW_DATABASE_FILE,
     outputDir: base.outputDir || FULL_HISTORY_OUTPUT_DIR,
     dailyDir: base.dailyDir || FULL_HISTORY_DAILY_DATA_DIR,
     stockListFile: base.stockListFile || FULL_HISTORY_STOCK_LIST_FILE,
@@ -2673,6 +2707,13 @@ function createFullHistoryJob(base = {}, items = []) {
     processId: Number(base.processId) || null,
     requiresCleanup: Boolean(base.requiresCleanup),
     cleanupReason: base.cleanupReason || '',
+    hasDateOverlap: Boolean(base.hasDateOverlap),
+    overlapReason: base.overlapReason || '',
+    overlapRanges: Array.isArray(base.overlapRanges) ? base.overlapRanges : [],
+    appendMode: Boolean(base.appendMode),
+    datasetId: Number(base.datasetId) || null,
+    previousStartDate: normalizeFullHistoryDate(base.previousStartDate),
+    previousEndDate: normalizeFullHistoryDate(base.previousEndDate),
     indexStartDate: normalizeFullHistoryDate(base.indexStartDate),
     indexEndDate: normalizeFullHistoryDate(base.indexEndDate),
     indexedStockCount: Number(base.indexedStockCount) || 0,
@@ -2711,6 +2752,7 @@ function createFullHistoryJob(base = {}, items = []) {
     items: items.map(item => ({
       code: normalizeCacheCode(item.code || item.thscode || ''),
       name: String(item.name || item.stockName || item.code || item.thscode || '').trim(),
+      securityType: item.securityType || inferFullHistorySecurityType(item),
       status: item.status || 'pending',
       rowCount: Number(item.rowCount) || 0,
       failedCount: Number(item.failedCount) || 0,
@@ -2726,6 +2768,7 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
   const items = Array.isArray(job?.items) ? job.items : []
   const dates = Array.isArray(job?.dates) ? job.dates : []
   const total = items.length
+  const historyTotal = items.filter(isFullHistoryAStock).length
   const legacyFetched = items.filter(item => item.status === 'done').length
   const legacyFailed = items.filter(item => item.status === 'failed').length
   const legacySkipped = items.filter(item => item.status === 'skipped').length
@@ -2754,6 +2797,7 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     currentName: job?.currentName || '',
     nextRequestAt: job?.nextRequestAt || null,
     outputFile: job?.outputFile || '',
+    databaseFile: job?.databaseFile || STOCK_REVIEW_DATABASE_FILE,
     outputDir: job?.outputDir || FULL_HISTORY_OUTPUT_DIR,
     dataDir: FULL_HISTORY_DATA_DIR,
     dailyDir: job?.dailyDir || FULL_HISTORY_DAILY_DATA_DIR,
@@ -2761,7 +2805,9 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     calculateStockListFile: job?.calculateStockListFile || FULL_HISTORY_CALCULATE_STOCK_LIST_FILE,
     stockIndexFile: job?.stockIndexFile || resolveFullHistoryStockIndexFile(),
     snapshotExecutable: FULL_HISTORY_SNAPSHOT_EXECUTABLE,
-    snapshotCommand: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} --output ${FULL_HISTORY_STOCK_LIST_NAME} --source baostock`,
+    snapshotCommand: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} --database "${STOCK_REVIEW_DATABASE_NAME}" --source baostock`,
+    dailySnapshotExecutable: FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE,
+    dailySnapshotCommand: `${FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME} --database "${STOCK_REVIEW_DATABASE_NAME}" --date <快照日期> --source auto`,
     dateIndexFile: job?.dateIndexFile || FULL_HISTORY_DATE_INDEX_FILE,
     metaFile: job?.metaFile || '',
     historyExecutable: job?.executable || FULL_HISTORY_EXECUTABLE,
@@ -2769,6 +2815,9 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     processId: Number(job?.processId) || null,
     requiresCleanup: Boolean(job?.requiresCleanup),
     cleanupReason: job?.cleanupReason || '',
+    hasDateOverlap: Boolean(job?.hasDateOverlap),
+    overlapReason: job?.overlapReason || '',
+    overlapRanges: Array.isArray(job?.overlapRanges) ? job.overlapRanges : [],
     indexStartDate: job?.indexStartDate || '',
     indexEndDate: job?.indexEndDate || '',
     indexedStockCount: Number(job?.indexedStockCount) || 0,
@@ -2777,6 +2826,7 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     stderr: String(job?.stderr || ''),
     total,
     stockTotal: total,
+    historyTotal,
     dateTotal: dates.length,
     recordTotal,
     processed,
@@ -2813,6 +2863,7 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     items: items.map(item => ({
       code: item.code,
       name: item.name || item.code,
+      securityType: item.securityType || inferFullHistorySecurityType(item),
       status: item.status,
       rowCount: Number(item.rowCount) || 0,
       failedCount: Number(item.failedCount) || 0,
@@ -3240,6 +3291,513 @@ function buildCalculateStockListPayload(snapshotPayload, stocks, startDate, endD
   }
 }
 
+function runExecutableJson(executable, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(executable)) {
+      reject(new Error(`未找到可执行程序：${executable}`))
+      return
+    }
+    const child = spawn(executable, args, {
+      cwd: FULL_HISTORY_DATA_DIR,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      shell: false
+    })
+    const stdout = []
+    const stderr = []
+    const timeout = Math.max(10000, Number(options.timeout) || 120000)
+    let settled = false
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try {
+        options.onFinish?.(child)
+      } catch {}
+      callback(value)
+    }
+    try {
+      options.onSpawn?.(child)
+    } catch {}
+    const timer = setTimeout(() => {
+      try {
+        child.kill()
+      } catch {}
+      finish(reject, new Error(`数据库命令执行超时（${Math.round(timeout / 1000)} 秒）`))
+    }, timeout)
+    child.stdout.on('data', chunk => stdout.push(chunk))
+    child.stderr.on('data', chunk => stderr.push(chunk))
+    child.on('error', error => finish(reject, new Error(`无法启动 ${path.basename(executable)}：${error.message}`)))
+    child.on('close', code => {
+      const outText = Buffer.concat(stdout).toString('utf8').trim()
+      const errText = Buffer.concat(stderr).toString('utf8').trim()
+      if (code !== 0) {
+        finish(reject, new Error(errText || outText || `${path.basename(executable)} 退出码 ${code}`))
+        return
+      }
+      const lines = outText.split(/\r?\n/).map(line => line.trim()).filter(Boolean).reverse()
+      for (const line of lines) {
+        try {
+          finish(resolve, JSON.parse(line))
+          return
+        } catch {}
+      }
+      finish(reject, new Error(`${path.basename(executable)} 未返回有效 JSON：${outText.slice(-500)}`))
+    })
+  })
+}
+
+function databaseStatusItems(payload) {
+  const rows = Array.isArray(payload?.stocks) ? payload.stocks : []
+  return rows.map(item => {
+    const rawStatus = String(item?.status || 'pending').toLowerCase()
+    const normalizedStatus = rawStatus === 'empty' ? 'skipped' : rawStatus === 'completed' ? 'done' : rawStatus
+    const securityType = item?.securityType || item?.security_type || inferFullHistorySecurityType(item)
+    const status = securityType === 'a_stock' ? normalizedStatus : 'not_applicable'
+    return {
+      code: normalizeCacheCode(item?.code || ''),
+      name: decodeLegacyStockName(item?.name || item?.code || ''),
+      securityType,
+      status: ['pending', 'running', 'done', 'skipped', 'failed', 'not_applicable'].includes(status) ? status : 'pending',
+      rowCount: Number(item?.rowCount) || 0,
+      failedCount: status === 'failed' ? 1 : 0,
+      skippedCount: status === 'skipped' ? 1 : 0,
+      message: status === 'not_applicable'
+        ? '历史获取仅限沪深北 A 股'
+        : String(item?.message || '').trim() || (status === 'done' ? '已写入数据库' : '未获取'),
+      updatedAt: item?.updatedAt || null
+    }
+  }).filter(item => item.code)
+}
+
+function applyDatabaseStatusToJob(payload, job = fullHistoryJob) {
+  const items = databaseStatusItems(payload)
+  if (items.length || Number(payload?.stockCount) === 0) job.items = items
+  const dataset = payload?.dataset || null
+  job.databaseFile = STOCK_REVIEW_DATABASE_FILE
+  job.indexStartDate = normalizeFullHistoryDate(dataset?.start_date || dataset?.startDate || '')
+  job.indexEndDate = normalizeFullHistoryDate(dataset?.end_date || dataset?.endDate || '')
+  job.indexedStockCount = items.filter(item => item.status !== 'pending').length
+  job.missingStockCount = Number(payload?.missingStockCount ?? items.filter(item => item.status === 'pending' || item.status === 'failed').length) || 0
+  return items
+}
+
+function databaseQueryExecutable() {
+  if (fs.existsSync(FULL_HISTORY_EXECUTABLE)) return FULL_HISTORY_EXECUTABLE
+  if (fs.existsSync(FULL_HISTORY_SNAPSHOT_EXECUTABLE)) return FULL_HISTORY_SNAPSHOT_EXECUTABLE
+  return ''
+}
+
+async function queryFullHistoryDatabaseStatus() {
+  const executable = databaseQueryExecutable()
+  if (!executable) throw new Error(`未找到数据库查询程序，请放入 ${FULL_HISTORY_EXECUTABLE_NAME} 或 ${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)}`)
+  return runExecutableJson(executable, ['--database', STOCK_REVIEW_DATABASE_NAME, '--status-json'])
+}
+
+function normalizeSqliteCalculationDate(value, label) {
+  const date = normalizeFullHistoryDate(value)
+  if (!date) throw new Error(`请选择有效的${label}`)
+  return date
+}
+
+function decodeLegacyStockName(value) {
+  const text = String(value || '').trim()
+  if (!text || /[\u3400-\u9fff]/.test(text) || !/[\x80-\xff]/.test(text)) return text
+  try {
+    const decoded = new TextDecoder('gb18030').decode(Buffer.from(text, 'latin1')).trim()
+    return /[\u3400-\u9fff]/.test(decoded) ? decoded : text
+  } catch {
+    return text
+  }
+}
+
+function getSqlJsRuntime() {
+  if (!sqlJsRuntimePromise) {
+    const runtimeRequire = eval('require')
+    const packagedRuntime = path.join(__dirname, 'sql-asm.js')
+    const initSqlJs = runtimeRequire(fs.existsSync(packagedRuntime) ? packagedRuntime : 'sql.js/dist/sql-asm.js')
+    sqlJsRuntimePromise = initSqlJs()
+  }
+  return sqlJsRuntimePromise
+}
+
+// 历史程序以 WAL 模式写 SQLite。sql.js 只认识主数据库文件，不能把 -wal
+// 中的已提交事务一起读写，因此这里只让 sql.js 承担计算页的大批量只读查询；
+// 涉及历史数据范围和状态的读写统一交给 Python 标准库 sqlite3 的真实连接。
+const SQLITE_HISTORY_BRIDGE_SCRIPT = String.raw`
+import datetime
+import json
+import sqlite3
+import sys
+
+payload = json.load(sys.stdin)
+database_file = str(payload.get("databaseFile") or "")
+operation = str(payload.get("operation") or "")
+connection = None
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+def one(sql, parameters=()):
+    row = connection.execute(sql, parameters).fetchone()
+    return dict(row) if row is not None else None
+
+try:
+    if not database_file:
+        raise ValueError("未提供 SQLite 数据库文件")
+
+    connection = sqlite3.connect(database_file, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 30000")
+
+    if operation == "inspect_coverage":
+        connection.execute("PRAGMA query_only = ON")
+        dataset = one("""
+            SELECT id, start_date AS startDate, end_date AS endDate, source, adjust
+            FROM history_datasets
+            WHERE is_active = 1
+            ORDER BY id DESC
+            LIMIT 1
+        """)
+        if not dataset:
+            result = {
+                "ok": True,
+                "datasetId": None,
+                "existingStartDate": "",
+                "existingEndDate": "",
+                "existingTradeDateCount": 0,
+                "overlapRanges": []
+            }
+        else:
+            coverage = one("""
+                SELECT MIN(trade_date) AS startDate,
+                       MAX(trade_date) AS endDate,
+                       COUNT(DISTINCT trade_date) AS tradeDateCount
+                FROM daily_bars
+                WHERE dataset_id = ?
+            """, (dataset["id"],)) or {}
+            overlap = one("""
+                SELECT MIN(trade_date) AS startDate,
+                       MAX(trade_date) AS endDate,
+                       COUNT(DISTINCT trade_date) AS tradeDateCount
+                FROM daily_bars
+                WHERE dataset_id = ?
+                  AND trade_date BETWEEN ? AND ?
+            """, (dataset["id"], payload.get("startDate"), payload.get("endDate"))) or {}
+            overlap_count = int(overlap.get("tradeDateCount") or 0)
+            result = {
+                "ok": True,
+                "datasetId": int(dataset["id"]),
+                "source": str(dataset.get("source") or "baostock"),
+                "adjust": str(dataset.get("adjust") or "1"),
+                "existingStartDate": str(coverage.get("startDate") or ""),
+                "existingEndDate": str(coverage.get("endDate") or ""),
+                "existingTradeDateCount": int(coverage.get("tradeDateCount") or 0),
+                "overlapRanges": ([{
+                    "startDate": str(overlap.get("startDate") or ""),
+                    "endDate": str(overlap.get("endDate") or ""),
+                    "tradeDateCount": overlap_count
+                }] if overlap_count else [])
+            }
+
+    elif operation == "prepare_append":
+        dataset_id = int(payload.get("datasetId") or 0)
+        if not dataset_id:
+            raise ValueError("未找到要追加的活动历史数据集")
+        now = utc_now()
+        connection.execute("BEGIN IMMEDIATE")
+        active = one("SELECT id FROM history_datasets WHERE id = ? AND is_active = 1", (dataset_id,))
+        if not active:
+            raise ValueError("活动历史数据集已发生变化，请刷新页面后重试")
+        connection.execute("""
+            UPDATE history_datasets
+            SET start_date = ?,
+                end_date = ?,
+                status = 'ready',
+                updated_at = ?,
+                completed_at = NULL,
+                message = '准备追加新的历史日期区间'
+            WHERE id = ?
+        """, (payload.get("startDate"), payload.get("endDate"), now, dataset_id))
+        connection.execute("DELETE FROM stock_history_status WHERE dataset_id = ?", (dataset_id,))
+        connection.commit()
+        result = {"ok": True, "datasetId": dataset_id}
+
+    elif operation == "reconcile_append":
+        connection.execute("BEGIN IMMEDIATE")
+        dataset = one("""
+            SELECT id FROM history_datasets
+            WHERE is_active = 1
+            ORDER BY id DESC
+            LIMIT 1
+        """)
+        if not dataset:
+            raise ValueError("未找到活动历史数据集，无法同步历史日期范围")
+        dataset_id = int(dataset["id"])
+        expected_dataset_id = int(payload.get("datasetId") or 0)
+        if expected_dataset_id and dataset_id != expected_dataset_id:
+            raise ValueError("活动历史数据集已发生变化，拒绝合并到其他数据集")
+        coverage = one("""
+            SELECT MIN(trade_date) AS startDate, MAX(trade_date) AS endDate
+            FROM daily_bars
+            WHERE dataset_id = ?
+        """, (dataset_id,)) or {}
+        merged_start = str(coverage.get("startDate") or payload.get("previousStartDate") or payload.get("startDate") or "")
+        merged_end = str(coverage.get("endDate") or payload.get("previousEndDate") or payload.get("endDate") or "")
+        now = utc_now()
+        connection.execute("""
+            UPDATE history_datasets
+            SET start_date = ?,
+                end_date = ?,
+                updated_at = ?,
+                message = '历史数据已按非重合日期区间追加'
+            WHERE id = ?
+        """, (merged_start, merged_end, now, dataset_id))
+        connection.execute("""
+            UPDATE stock_history_status
+            SET request_start_date = ?,
+                request_end_date = ?,
+                first_trade_date = (
+                    SELECT MIN(b.trade_date) FROM daily_bars b
+                    WHERE b.dataset_id = stock_history_status.dataset_id
+                      AND b.stock_code = stock_history_status.stock_code
+                ),
+                last_trade_date = (
+                    SELECT MAX(b.trade_date) FROM daily_bars b
+                    WHERE b.dataset_id = stock_history_status.dataset_id
+                      AND b.stock_code = stock_history_status.stock_code
+                ),
+                row_count = (
+                    SELECT COUNT(*) FROM daily_bars b
+                    WHERE b.dataset_id = stock_history_status.dataset_id
+                      AND b.stock_code = stock_history_status.stock_code
+                ),
+                status = CASE WHEN EXISTS (
+                    SELECT 1 FROM daily_bars b
+                    WHERE b.dataset_id = stock_history_status.dataset_id
+                      AND b.stock_code = stock_history_status.stock_code
+                ) THEN 'done' ELSE status END,
+                error_message = CASE WHEN EXISTS (
+                    SELECT 1 FROM daily_bars b
+                    WHERE b.dataset_id = stock_history_status.dataset_id
+                      AND b.stock_code = stock_history_status.stock_code
+                ) THEN '' ELSE error_message END,
+                updated_at = ?
+            WHERE dataset_id = ?
+        """, (merged_start, merged_end, now, dataset_id))
+        connection.commit()
+
+        # checkpoint 只是回收 WAL 空间；即使有其他读连接导致 busy，事务本身也已经安全提交。
+        checkpoint = list(connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone())
+        result = {
+            "ok": True,
+            "datasetId": dataset_id,
+            "startDate": merged_start,
+            "endDate": merged_end,
+            "checkpoint": checkpoint
+        }
+    else:
+        raise ValueError("不支持的 SQLite 历史数据操作: %s" % operation)
+except Exception as error:
+    if connection is not None:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+    result = {"ok": False, "error": str(error)}
+finally:
+    if connection is not None:
+        connection.close()
+
+print(json.dumps(result, ensure_ascii=False))
+`
+
+function formatSqliteHistoryBridgeError(error) {
+  const message = String(error?.message || error || 'SQLite 操作失败').trim()
+  if (/database is locked|database table is locked/i.test(message)) {
+    return new Error('SQLite 正被其他历史任务或数据库工具写入，请等待写入完成后重试')
+  }
+  return new Error(message)
+}
+
+async function runSqliteHistoryOperation(operation, payload = {}) {
+  const input = {
+    ...payload,
+    operation,
+    databaseFile: STOCK_REVIEW_DATABASE_FILE
+  }
+  const candidates = Array.from(new Set([
+    String(process.env.PYTHON || '').trim(),
+    'python',
+    'py'
+  ].filter(Boolean)))
+  let lastStartError = null
+
+  for (const pythonPath of candidates) {
+    try {
+      const result = await runPythonJson({
+        pythonPath,
+        script: SQLITE_HISTORY_BRIDGE_SCRIPT,
+        input,
+        timeout: 120000,
+        label: 'SQLite 历史数据操作'
+      })
+      if (!result?.ok) throw new Error(result?.error || 'SQLite 历史数据操作失败')
+      return result
+    } catch (error) {
+      if (/无法启动 Python/i.test(String(error?.message || error))) {
+        lastStartError = error
+        continue
+      }
+      throw formatSqliteHistoryBridgeError(error)
+    }
+  }
+
+  throw new Error(`无法启动 Python sqlite3 运行环境：${lastStartError?.message || '未找到 python/py 命令'}`)
+}
+
+async function inspectFullHistoryDateCoverage(startDate, endDate) {
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    return { datasetId: null, existingStartDate: '', existingEndDate: '', overlapRanges: [] }
+  }
+  const result = await runSqliteHistoryOperation('inspect_coverage', { startDate, endDate })
+  return {
+    datasetId: result.datasetId ? Number(result.datasetId) : null,
+    source: String(result.source || 'baostock'),
+    adjust: String(result.adjust || '1'),
+    existingStartDate: normalizeFullHistoryDate(result.existingStartDate),
+    existingEndDate: normalizeFullHistoryDate(result.existingEndDate),
+    existingTradeDateCount: Number(result.existingTradeDateCount) || 0,
+    overlapRanges: (Array.isArray(result.overlapRanges) ? result.overlapRanges : []).map(range => ({
+      startDate: normalizeFullHistoryDate(range.startDate),
+      endDate: normalizeFullHistoryDate(range.endDate),
+      tradeDateCount: Number(range.tradeDateCount) || 0
+    })).filter(range => range.startDate && range.endDate && range.tradeDateCount > 0)
+  }
+}
+
+async function prepareFullHistoryDatabaseAppend(coverage, startDate, endDate) {
+  if (!coverage?.datasetId) return { appendMode: false }
+  await runSqliteHistoryOperation('prepare_append', {
+    datasetId: coverage.datasetId,
+    startDate,
+    endDate
+  })
+  return {
+    appendMode: true,
+    datasetId: coverage.datasetId,
+    previousStartDate: coverage.existingStartDate || '',
+    previousEndDate: coverage.existingEndDate || ''
+  }
+}
+
+async function reconcileFullHistoryAppendDataset(job) {
+  if (!job?.appendMode || !fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) return null
+  const result = await runSqliteHistoryOperation('reconcile_append', {
+    datasetId: job.datasetId,
+    startDate: job.startDate,
+    endDate: job.endDate,
+    previousStartDate: job.previousStartDate,
+    previousEndDate: job.previousEndDate
+  })
+  const mergedStartDate = normalizeFullHistoryDate(result.startDate) || job.previousStartDate || job.startDate
+  const mergedEndDate = normalizeFullHistoryDate(result.endDate) || job.previousEndDate || job.endDate
+  job.indexStartDate = mergedStartDate
+  job.indexEndDate = mergedEndDate
+  return {
+    startDate: mergedStartDate,
+    endDate: mergedEndDate,
+    checkpoint: Array.isArray(result.checkpoint) ? result.checkpoint : []
+  }
+}
+
+// 从本地 SQLite 读取筛选所需的最近 61 根日 K。股票代码采用白名单，避免指数、ETF、债券等混入计算。
+async function readStockHistoryFromSqlite(options = {}) {
+  const startDate = normalizeSqliteCalculationDate(options.startDate, '开始日期')
+  const endDate = normalizeSqliteCalculationDate(options.endDate, '结束日期')
+  if (startDate > endDate) throw new Error('开始日期不能晚于结束日期')
+  if (isFullHistoryActive()) throw new Error('历史数据正在写入 SQLite，请等待获取完成后再计算')
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    throw new Error(`未找到 SQLite 数据库：${STOCK_REVIEW_DATABASE_FILE}`)
+  }
+
+  const SQL = await getSqlJsRuntime()
+  const database = new SQL.Database(fs.readFileSync(STOCK_REVIEW_DATABASE_FILE))
+  const rows = []
+  let statement = null
+  try {
+    statement = database.prepare(`
+      WITH ranked_bars AS (
+        SELECT
+          b.stock_code AS code,
+          s.name AS name,
+          b.trade_date AS time,
+          b.open AS open,
+          b.high AS high,
+          b.low AS low,
+          b.close AS close,
+          b.volume AS volume,
+          b.amount AS amount,
+          b.change_ratio AS changeRatio,
+          b.turnover_rate AS turnoverRate,
+          ROW_NUMBER() OVER (
+            PARTITION BY b.stock_code
+            ORDER BY b.trade_date DESC
+          ) AS row_number
+        FROM daily_bars b
+        JOIN history_datasets d ON d.id = b.dataset_id AND d.is_active = 1
+        JOIN stocks s ON s.code = b.stock_code AND s.is_active = 1
+        WHERE b.trade_date BETWEEN $startDate AND $endDate
+          AND LENGTH(s.symbol) = 6
+          AND (
+            (s.market = 'SH' AND SUBSTR(s.symbol, 1, 3) IN ('600', '601', '603', '605', '688', '689'))
+            OR (s.market = 'SZ' AND SUBSTR(s.symbol, 1, 3) IN ('000', '001', '002', '003', '300', '301'))
+            OR (s.market = 'BJ' AND (SUBSTR(s.symbol, 1, 1) IN ('4', '8') OR SUBSTR(s.symbol, 1, 3) = '920'))
+          )
+      )
+      SELECT code, name, time, open, high, low, close, volume, amount, changeRatio, turnoverRate
+      FROM ranked_bars
+      WHERE row_number <= 61
+      ORDER BY code, time
+    `)
+    statement.bind({ $startDate: startDate, $endDate: endDate })
+    while (statement.step()) {
+      const row = statement.getAsObject()
+      rows.push({ ...row, name: decodeLegacyStockName(row.name) })
+    }
+  } finally {
+    try { statement?.free() } catch {}
+    database.close()
+  }
+
+  if (!rows.length) {
+    throw new Error(`SQLite 中没有 ${startDate} 至 ${endDate} 的 A 股日 K 数据`)
+  }
+  const stockCount = new Set(rows.map(row => row.code)).size
+  return {
+    ok: true,
+    endpoint: 'sqlite_stock_history',
+    databaseFile: STOCK_REVIEW_DATABASE_FILE,
+    startDate,
+    endDate,
+    stockCount,
+    rowCount: rows.length,
+    maxBarsPerStock: 61,
+    readAt: new Date().toISOString(),
+    rows
+  }
+}
+
+async function checkFullHistoryDatabase(startDate, endDate) {
+  return runExecutableJson(FULL_HISTORY_EXECUTABLE, [
+    '--database', STOCK_REVIEW_DATABASE_NAME,
+    '--start', startDate,
+    '--end', endDate,
+    '--source', 'baostock',
+    '--check'
+  ])
+}
+
 function prepareFullHistoryExecutableInput(startDate, endDate) {
   const combined = readCombinedFullHistoryItems()
   if (!combined.snapshotPayload || !combined.snapshotRows.length) {
@@ -3310,7 +3868,6 @@ function appendFullHistoryProcessOutput(job, key, chunk) {
 
 function startFullHistoryExecutableProcess(job) {
   const args = buildFullHistoryArgs(job.startDate, job.endDate)
-  fs.mkdirSync(FULL_HISTORY_OUTPUT_DIR, { recursive: true })
   const child = spawn(FULL_HISTORY_EXECUTABLE, args, {
     cwd: FULL_HISTORY_DATA_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -3322,6 +3879,39 @@ function startFullHistoryExecutableProcess(job) {
   job.processId = Number(child.pid) || null
   job.command = buildFullHistoryCommand(job.startDate, job.endDate)
   job.message = `历史数据程序已启动，进程 PID ${job.processId || '--'}`
+  job.stdoutLineBuffer = ''
+
+  const applyProgressLine = line => {
+    if (!line.startsWith('STOCK_PROGRESS_JSON:')) return
+    try {
+      const event = JSON.parse(line.slice('STOCK_PROGRESS_JSON:'.length))
+      const code = normalizeCacheCode(event?.code || '')
+      if (!code) return
+      const index = job.items.findIndex(item => item.code === code)
+      const rawStatus = String(event?.status || 'pending').toLowerCase()
+      const status = rawStatus === 'empty' ? 'skipped' : rawStatus
+      const next = {
+        code,
+        name: String(event?.name || code),
+        status: ['pending', 'running', 'done', 'skipped', 'failed'].includes(status) ? status : 'pending',
+        rowCount: Number(event?.rowCount) || 0,
+        failedCount: status === 'failed' ? 1 : 0,
+        skippedCount: status === 'skipped' ? 1 : 0,
+        message: String(event?.message || '').trim(),
+        updatedAt: event?.updatedAt || new Date().toISOString()
+      }
+      if (index >= 0) job.items[index] = { ...job.items[index], ...next, name: job.items[index].name || next.name }
+      else job.items.push(next)
+    } catch {}
+  }
+
+  const consumeStdout = chunk => {
+    const text = Buffer.from(chunk).toString('utf8')
+    appendFullHistoryProcessOutput(job, 'stdout', chunk)
+    const parts = `${job.stdoutLineBuffer || ''}${text}`.split(/\r?\n/)
+    job.stdoutLineBuffer = parts.pop() || ''
+    parts.forEach(applyProgressLine)
+  }
 
   let finalized = false
   const finalize = (code, error = null) => {
@@ -3330,17 +3920,26 @@ function startFullHistoryExecutableProcess(job) {
     if (fullHistoryProcess === child) fullHistoryProcess = null
     job.processId = null
     job.finishedAt = new Date().toISOString()
-    const combined = refreshFullHistoryJobItemsFromDisk(job)
+    if (job.stdoutLineBuffer) applyProgressLine(job.stdoutLineBuffer)
+    const reconcileAppend = () => {
+      if (!job.appendMode) return Promise.resolve(null)
+      return reconcileFullHistoryAppendDataset(job).catch(appendError => {
+        addFullHistoryError(job, `合并历史日期范围失败：${appendError.message || appendError}`)
+        return null
+      })
+    }
 
     if (job.cancelRequested) {
       job.status = 'stopped'
       job.message = '已停止历史数据程序'
+      reconcileAppend()
       return
     }
     if (error) {
       job.status = 'failed'
       job.message = `历史数据程序启动失败：${error.message || error}`
       addFullHistoryError(job, job.message)
+      reconcileAppend()
       return
     }
     if (code !== 0) {
@@ -3348,19 +3947,25 @@ function startFullHistoryExecutableProcess(job) {
       job.status = 'failed'
       job.message = `历史数据程序执行失败，退出码 ${code}${detail ? `：${detail}` : ''}`
       addFullHistoryError(job, job.message)
-      return
-    }
-    if (!combined.index.exists || !combined.index.readable) {
-      job.status = 'failed'
-      job.message = `历史数据程序已退出，但未生成有效的股票数据索引：${resolveFullHistoryStockIndexFile()}`
-      addFullHistoryError(job, job.message)
+      reconcileAppend()
       return
     }
     job.status = 'completed'
-    job.message = `历史数据程序执行完成，股票数据索引共 ${combined.index.rowsByCode.size} 只`
+    job.message = job.appendMode
+      ? '历史数据程序执行完成，正在合并 SQLite 历史日期范围'
+      : '历史数据程序执行完成，数据已写入 SQLite'
+    reconcileAppend()
+      .then(() => queryFullHistoryDatabaseStatus())
+      .then(payload => {
+        applyDatabaseStatusToJob(payload, job)
+        job.message = job.appendMode
+          ? `历史数据追加完成，SQLite 当前历史范围为 ${job.indexStartDate || '--'} 至 ${job.indexEndDate || '--'}`
+          : '历史数据程序执行完成，数据已写入 SQLite'
+      })
+      .catch(queryError => addFullHistoryError(job, `读取数据库状态失败：${queryError.message || queryError}`))
   }
 
-  child.stdout.on('data', chunk => appendFullHistoryProcessOutput(job, 'stdout', chunk))
+  child.stdout.on('data', consumeStdout)
   child.stderr.on('data', chunk => appendFullHistoryProcessOutput(job, 'stderr', chunk))
   child.on('error', error => finalize(null, error))
   child.on('close', code => finalize(code))
@@ -3429,29 +4034,22 @@ function assertFullHistoryCleanupPath(target) {
 
 async function cleanupFullMarketHistoryExecutableData() {
   if (isFullHistoryActive()) throw new Error('历史数据程序运行中，无法清理；请先停止任务')
-  const targets = [
-    { path: FULL_HISTORY_OUTPUT_DIR, recursive: true },
-    { path: FULL_HISTORY_ROOT_STOCK_INDEX_FILE, recursive: false },
-    { path: FULL_HISTORY_CALCULATE_STOCK_LIST_FILE, recursive: false }
-  ]
-  const removed = []
-  for (const target of targets) {
-    const resolved = assertFullHistoryCleanupPath(target.path)
-    if (!fs.existsSync(resolved)) continue
-    await fs.promises.rm(resolved, { recursive: target.recursive, force: true })
-    removed.push(resolved)
-  }
-
-  const combined = readCombinedFullHistoryItems()
+  const result = await runExecutableJson(FULL_HISTORY_EXECUTABLE, [
+    '--database', STOCK_REVIEW_DATABASE_NAME,
+    '--clear-history'
+  ], { timeout: 120000 })
+  const databaseStatus = await queryFullHistoryDatabaseStatus()
+  const items = databaseStatusItems(databaseStatus)
   fullHistoryJob = createFullHistoryJob({
     status: 'ready',
-    stockIndexFile: resolveFullHistoryStockIndexFile(),
-    message: `旧历史数据已清理${removed.length ? `：${removed.join('、')}` : '，没有发现需要删除的文件'}。请确认日期后重新点击“开始获取”`
-  }, combined.items)
+    databaseFile: STOCK_REVIEW_DATABASE_FILE,
+    message: result?.message || '旧历史数据已从 SQLite 清理，请重新点击“开始获取”'
+  }, items)
+  applyDatabaseStatusToJob(databaseStatus, fullHistoryJob)
   return {
     ...buildFullHistorySnapshot(fullHistoryJob),
     cleanupCompleted: true,
-    removedPaths: removed
+    removed: result?.removed || {}
   }
 }
 
@@ -3524,7 +4122,7 @@ function runFullMarketStockListExecutable(options = {}) {
       return
     }
 
-    const args = ['--output', FULL_HISTORY_STOCK_LIST_NAME, '--source', 'baostock']
+    const args = ['--database', STOCK_REVIEW_DATABASE_NAME, '--source', 'baostock']
     const stdout = []
     const stderr = []
     const timeout = Math.max(30000, Number(options.timeout) || 10 * 60 * 1000)
@@ -3560,7 +4158,7 @@ function runFullMarketStockListExecutable(options = {}) {
       }
       succeed({
         executable: FULL_HISTORY_SNAPSHOT_EXECUTABLE,
-        command: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} ${args.join(' ')}`,
+        command: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} --database "${STOCK_REVIEW_DATABASE_NAME}" --source baostock`,
         stdout: outText,
         stderr: errText
       })
@@ -3574,11 +4172,8 @@ async function refreshFullMarketStockListFromSnapshot(options = {}) {
   ensureFullHistoryDir()
 
   const startedAt = Date.now()
-  const previousItems = readFullMarketStockList() || []
+  const previousItems = Array.isArray(fullHistoryJob?.items) ? fullHistoryJob.items : []
   const previousStockCount = previousItems.length
-  const previousContent = fs.existsSync(FULL_HISTORY_STOCK_LIST_FILE)
-    ? fs.readFileSync(FULL_HISTORY_STOCK_LIST_FILE)
-    : null
 
   fullHistoryJob = createFullHistoryJob({
     ...fullHistoryJob,
@@ -3588,27 +4183,27 @@ async function refreshFullMarketStockListFromSnapshot(options = {}) {
 
   try {
     const result = await runFullMarketStockListExecutable(options)
-    if (!fs.existsSync(FULL_HISTORY_STOCK_LIST_FILE)) {
-      throw new Error(`程序执行成功，但未生成 ${FULL_HISTORY_STOCK_LIST_FILE}`)
-    }
-    const items = readFullMarketStockList()
-    if (!items?.length) throw new Error('程序生成的股票清单为空或 JSON 格式无法识别')
+    const databaseStatus = await runExecutableJson(FULL_HISTORY_SNAPSHOT_EXECUTABLE, [
+      '--database', STOCK_REVIEW_DATABASE_NAME,
+      '--status-json'
+    ])
+    const items = databaseStatusItems(databaseStatus)
+    if (!items.length) throw new Error('快照程序执行成功，但 SQLite 中没有有效股票数据')
 
     fullHistoryJob = createFullHistoryJob({
       ...fullHistoryJob,
       status: 'ready',
-      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
-      dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
-      dailyDir: FULL_HISTORY_DAILY_DATA_DIR,
-      message: `已通过 Baostock 程序生成全市场股票清单：${items.length} 只`
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      message: `已通过 Baostock 程序写入 SQLite 股票快照：${items.length} 只`
     }, items)
+    applyDatabaseStatusToJob(databaseStatus, fullHistoryJob)
 
     return {
       ...buildFullHistorySnapshot(fullHistoryJob),
       snapshotStockCount: items.length,
       previousStockCount,
       stockListUpdated: true,
-      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
       stockListSource: 'baostock_executable',
       snapshotExecutable: result.executable,
       snapshotCommand: result.command,
@@ -3619,22 +4214,11 @@ async function refreshFullMarketStockListFromSnapshot(options = {}) {
       refreshDurationMs: Date.now() - startedAt
     }
   } catch (error) {
-    if (previousContent) {
-      try {
-        fs.writeFileSync(FULL_HISTORY_STOCK_LIST_FILE, previousContent)
-      } catch {}
-    } else {
-      try {
-        fs.rmSync(FULL_HISTORY_STOCK_LIST_FILE, { force: true })
-      } catch {}
-    }
     const displayError = historyDisplayError(error)
     fullHistoryJob = createFullHistoryJob({
       status: 'failed',
-      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
-      dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
-      dailyDir: FULL_HISTORY_DAILY_DATA_DIR,
-      message: `刷新快照清单失败${previousItems.length ? '，已保留原清单' : ''}：${displayError}`,
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      message: `刷新 SQLite 股票快照失败${previousItems.length ? '，页面保留原状态' : ''}：${displayError}`,
       errors: [displayError]
     }, previousItems)
 
@@ -3643,12 +4227,103 @@ async function refreshFullMarketStockListFromSnapshot(options = {}) {
       snapshotStockCount: previousItems.length,
       previousStockCount,
       stockListUpdated: false,
-      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
       refreshFailed: true,
       fallbackUsed: false,
       error: displayError,
       refreshDurationMs: Date.now() - startedAt
     }
+  }
+}
+
+// 调用 v3 单日快照程序。程序会在同一事务中删除目标日期旧记录并写入新快照。
+async function fetchFullMarketDailySnapshot(options = {}) {
+  if (isFullHistoryActive()) throw new Error('历史数据正在写入 SQLite，请等待获取完成后再抓取每日快照')
+  ensureFullHistoryDir()
+
+  const queryDate = normalizeFullHistoryDate(options.date) || formatLocalYmd(new Date())
+  if (!queryDate) throw new Error('请选择有效的快照日期')
+  if (queryDate > formatLocalYmd(new Date())) throw new Error('快照日期不能晚于当前日期')
+  if (!fs.existsSync(FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE)) {
+    throw new Error(`未找到每日快照程序，请将 ${FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME} 放入：${FULL_HISTORY_DATA_DIR}`)
+  }
+
+  const args = [
+    '--database', STOCK_REVIEW_DATABASE_NAME,
+    '--date', queryDate,
+    '--source', String(options.source || 'auto')
+  ]
+  const command = `${FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME} ${args.map(quoteCommandArgument).join(' ')}`
+  fullDailySnapshotCancelRequested = false
+  fullHistoryJob = createFullHistoryJob({
+    ...fullHistoryJob,
+    status: 'daily_snapshot_running',
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    processId: null,
+    cancelRequested: false,
+    databaseFile: STOCK_REVIEW_DATABASE_FILE,
+    message: `正在获取 ${queryDate} 每日快照`
+  }, fullHistoryJob?.items || [])
+
+  try {
+    const result = await runExecutableJson(FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE, args, {
+      timeout: Math.max(10 * 60 * 1000, Number(options.timeout) || 45 * 60 * 1000),
+      onSpawn: child => {
+        fullDailySnapshotProcess = child
+        fullHistoryJob.processId = Number(child.pid) || null
+        fullHistoryJob.message = `每日快照程序已启动，进程 PID ${fullHistoryJob.processId || '--'}`
+      },
+      onFinish: child => {
+        if (fullDailySnapshotProcess === child) fullDailySnapshotProcess = null
+        fullHistoryJob.processId = null
+      }
+    })
+    const databaseStatus = await queryFullHistoryDatabaseStatus()
+    const items = databaseStatusItems(databaseStatus)
+    fullHistoryJob = createFullHistoryJob({
+      ...fullHistoryJob,
+      status: 'ready',
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      message: result?.message || `${queryDate} 每日快照已写入 SQLite`
+    }, items)
+    applyDatabaseStatusToJob(databaseStatus, fullHistoryJob)
+    return {
+      ...buildFullHistorySnapshot(fullHistoryJob),
+      dailySnapshotResult: result,
+      dailySnapshotDate: queryDate,
+      dailySnapshotExecutable: FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE,
+      dailySnapshotCommand: command
+    }
+  } catch (error) {
+    if (fullDailySnapshotCancelRequested) {
+      fullDailySnapshotCancelRequested = false
+      fullHistoryJob = createFullHistoryJob({
+        ...fullHistoryJob,
+        status: 'stopped',
+        processId: null,
+        cancelRequested: false,
+        finishedAt: new Date().toISOString(),
+        databaseFile: STOCK_REVIEW_DATABASE_FILE,
+        message: `已停止获取 ${queryDate} 每日快照`
+      }, fullHistoryJob?.items || [])
+      return {
+        ...buildFullHistorySnapshot(fullHistoryJob),
+        dailySnapshotCancelled: true,
+        dailySnapshotDate: queryDate,
+        dailySnapshotExecutable: FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE,
+        dailySnapshotCommand: command
+      }
+    }
+    const displayError = historyDisplayError(error)
+    fullHistoryJob = createFullHistoryJob({
+      ...fullHistoryJob,
+      status: 'failed',
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      message: `获取 ${queryDate} 每日快照失败：${displayError}`,
+      errors: [...(fullHistoryJob?.errors || []), displayError]
+    }, fullHistoryJob?.items || [])
+    throw new Error(fullHistoryJob.message)
   }
 }
 
@@ -4396,20 +5071,16 @@ async function prepareFullMarketHistoryList(options = {}) {
   })
 
   try {
-    const combined = readCombinedFullHistoryItems()
-    if (!combined.items.length) {
-      throw new Error(`未读取到有效快照清单：${FULL_HISTORY_STOCK_LIST_FILE}`)
-    }
+    const databaseStatus = await queryFullHistoryDatabaseStatus()
+    const items = databaseStatusItems(databaseStatus)
+    if (!items.length) throw new Error('SQLite 数据库中没有有效股票快照，请先点击“刷新快照清单”')
     fullHistoryJob = createFullHistoryJob({
       ...fullHistoryJob,
       status: 'ready',
-      stockIndexFile: combined.index.filePath,
-      indexStartDate: combined.index.startDate,
-      indexEndDate: combined.index.endDate,
-      indexedStockCount: combined.index.rowsByCode.size,
-      missingStockCount: combined.items.filter(item => item.status === 'pending').length,
-      message: `已合并快照清单与股票数据索引，共 ${combined.items.length} 只股票`
-    }, combined.items)
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      message: `已从 SQLite 加载 ${items.length} 只股票及历史状态`
+    }, items)
+    applyDatabaseStatusToJob(databaseStatus, fullHistoryJob)
   } catch (error) {
     fullHistoryJob.status = 'failed'
     fullHistoryJob.message = error.message || '加载全市场股票列表失败'
@@ -4428,36 +5099,69 @@ async function startFullMarketHistorySync(options = {}) {
   if (!startDate || !endDate) throw new Error('请先选择开始时间和结束时间')
   if (startDate > endDate) throw new Error('开始时间不能晚于结束时间')
 
-  const prepared = prepareFullHistoryExecutableInput(startDate, endDate)
-  if (prepared.requiresCleanup) {
+  if (!fs.existsSync(FULL_HISTORY_EXECUTABLE)) {
+    throw new Error(`未找到历史数据程序，请将 ${FULL_HISTORY_EXECUTABLE_NAME} 放入：${FULL_HISTORY_DATA_DIR}`)
+  }
+
+  const coverage = await inspectFullHistoryDateCoverage(startDate, endDate)
+  if (coverage.overlapRanges.length) {
+    const overlapText = coverage.overlapRanges
+      .map(range => `${range.startDate} 至 ${range.endDate}（${range.tradeDateCount} 个已存交易日）`)
+      .join('、')
     fullHistoryJob = createFullHistoryJob({
-      status: 'cleanup_required',
+      ...fullHistoryJob,
+      status: 'date_overlap',
       startDate,
       endDate,
-      stockIndexFile: prepared.index.filePath,
-      requiresCleanup: true,
-      cleanupReason: prepared.cleanupReason,
-      indexStartDate: prepared.index.startDate,
-      indexEndDate: prepared.index.endDate,
-      indexedStockCount: prepared.index.rowsByCode.size,
-      message: '页面日期与已有历史数据范围不一致，需要确认清理旧数据'
-    }, prepared.items)
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      hasDateOverlap: true,
+      overlapRanges: coverage.overlapRanges,
+      overlapReason: `所选日期 ${startDate} 至 ${endDate} 与 SQLite 已有历史数据重合：${overlapText}。请调整为不重合的日期区间后再开始获取。`,
+      indexStartDate: coverage.existingStartDate,
+      indexEndDate: coverage.existingEndDate,
+      message: '所选日期范围与 SQLite 已有历史数据重合，未启动获取'
+    }, fullHistoryJob.items || [])
     return buildFullHistorySnapshot(fullHistoryJob)
   }
 
-  if (prepared.noWork) {
+  const appendContext = await prepareFullHistoryDatabaseAppend(coverage, startDate, endDate)
+  let prepared = null
+  try {
+    prepared = await checkFullHistoryDatabase(startDate, endDate)
+    if (!prepared?.ok) throw new Error(prepared?.message || 'SQLite 历史数据启动检查失败')
+    if (prepared.requiresCleanup) {
+      throw new Error(prepared.cleanupReason || prepared.message || 'SQLite 无法准备追加历史日期区间')
+    }
+  } catch (error) {
+    if (appendContext.appendMode) {
+      try {
+        await reconcileFullHistoryAppendDataset({
+          ...appendContext,
+          startDate,
+          endDate
+        })
+      } catch (restoreError) {
+        throw new Error(`${error.message || error}；恢复原历史日期范围失败：${restoreError.message || restoreError}`)
+      }
+    }
+    throw error
+  }
+  const preparedItems = databaseStatusItems(prepared)
+
+  if (Number(prepared.missingStockCount) === 0) {
+    const dataset = prepared?.dataset || {}
     fullHistoryJob = createFullHistoryJob({
       status: 'completed',
       startDate,
       endDate,
       finishedAt: new Date().toISOString(),
-      stockIndexFile: prepared.index.filePath,
-      indexStartDate: prepared.index.startDate,
-      indexEndDate: prepared.index.endDate,
-      indexedStockCount: prepared.index.rowsByCode.size,
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      indexStartDate: dataset.start_date || startDate,
+      indexEndDate: dataset.end_date || endDate,
+      indexedStockCount: preparedItems.filter(item => item.status !== 'pending').length,
       missingStockCount: 0,
-      message: '快照清单中的股票均已存在于股票数据索引，无需再次获取'
-    }, prepared.items)
+      message: 'SQLite 中的当前股票均已有历史数据，无需再次获取'
+    }, preparedItems)
     return buildFullHistorySnapshot(fullHistoryJob)
   }
 
@@ -4466,27 +5170,21 @@ async function startFullMarketHistorySync(options = {}) {
     startDate,
     endDate,
     startedAt: new Date().toISOString(),
-    outputFile: FULL_HISTORY_OUTPUT_DIR,
-    outputDir: FULL_HISTORY_OUTPUT_DIR,
-    stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
-    calculateStockListFile: FULL_HISTORY_CALCULATE_STOCK_LIST_FILE,
-    stockIndexFile: prepared.index.filePath,
+    databaseFile: STOCK_REVIEW_DATABASE_FILE,
     executable: FULL_HISTORY_EXECUTABLE,
     command: buildFullHistoryCommand(startDate, endDate),
-    indexStartDate: prepared.index.startDate,
-    indexEndDate: prepared.index.endDate,
-    indexedStockCount: prepared.index.rowsByCode.size,
-    missingStockCount: prepared.missingStockCount,
-    message: `已生成计算清单 ${prepared.calculateCount} 只，正在启动历史数据程序`
-  }, prepared.items)
-
-  if (!fs.existsSync(FULL_HISTORY_EXECUTABLE)) {
-    fullHistoryJob.status = 'failed'
-    fullHistoryJob.finishedAt = new Date().toISOString()
-    fullHistoryJob.message = `未找到历史数据程序，请将 ${FULL_HISTORY_EXECUTABLE_NAME} 放入：${FULL_HISTORY_DATA_DIR}`
-    fullHistoryJob.errors.push(fullHistoryJob.message)
-    return buildFullHistorySnapshot(fullHistoryJob)
-  }
+    indexStartDate: prepared?.dataset?.start_date || '',
+    indexEndDate: prepared?.dataset?.end_date || '',
+    indexedStockCount: preparedItems.filter(item => item.status !== 'pending').length,
+    missingStockCount: Number(prepared.missingStockCount) || 0,
+    appendMode: Boolean(appendContext.appendMode),
+    datasetId: appendContext.datasetId || null,
+    previousStartDate: appendContext.previousStartDate || '',
+    previousEndDate: appendContext.previousEndDate || '',
+    message: appendContext.appendMode
+      ? `日期无重合，准备向 SQLite 追加 ${startDate} 至 ${endDate}，待获取 ${Number(prepared.missingStockCount) || 0} 只股票`
+      : `SQLite 启动检查完成，待获取 ${Number(prepared.missingStockCount) || 0} 只股票`
+  }, preparedItems)
 
   try {
     startFullHistoryExecutableProcess(fullHistoryJob)
@@ -4495,6 +5193,13 @@ async function startFullMarketHistorySync(options = {}) {
     fullHistoryJob.finishedAt = new Date().toISOString()
     fullHistoryJob.message = `无法启动历史数据程序：${error.message || error}`
     fullHistoryJob.errors.push(fullHistoryJob.message)
+    if (appendContext.appendMode) {
+      try {
+        await reconcileFullHistoryAppendDataset(fullHistoryJob)
+      } catch (restoreError) {
+        addFullHistoryError(fullHistoryJob, `恢复原历史日期范围失败：${restoreError.message || restoreError}`)
+      }
+    }
   }
   return buildFullHistorySnapshot(fullHistoryJob)
 }
@@ -4559,6 +5264,21 @@ function readFullHistoryFailedTasksFromDailyFiles() {
 }
 
 async function cancelFullMarketHistorySync() {
+  if (fullDailySnapshotProcess || fullHistoryJob?.status === 'daily_snapshot_running') {
+    fullDailySnapshotCancelRequested = true
+    fullHistoryJob.status = 'stopping'
+    fullHistoryJob.message = fullDailySnapshotProcess?.pid
+      ? `正在停止每日快照程序，进程 PID ${fullDailySnapshotProcess.pid}`
+      : '正在停止每日快照任务'
+    if (fullDailySnapshotProcess) {
+      await terminateFullHistoryProcess(fullDailySnapshotProcess)
+    } else {
+      fullHistoryJob.status = 'stopped'
+      fullHistoryJob.finishedAt = new Date().toISOString()
+      fullHistoryJob.message = '每日快照任务已停止'
+    }
+    return buildFullHistorySnapshot()
+  }
   if (!isFullHistoryActive()) return buildFullHistorySnapshot()
   fullHistoryJob.cancelRequested = true
   fullHistoryJob.status = 'stopping'
@@ -4656,11 +5376,17 @@ window.stockReviewBridge = {
   async fetchFreeStableData(options) {
     return fetchFreeStableData(options)
   },
+  async readStockHistoryFromSqlite(options) {
+    return readStockHistoryFromSqlite(options)
+  },
   async prepareFullMarketHistoryList(options) {
     return prepareFullMarketHistoryList(options)
   },
   async refreshFullMarketStockListFromSnapshot(options) {
     return refreshFullMarketStockListFromSnapshot(options)
+  },
+  async fetchFullMarketDailySnapshot(options) {
+    return fetchFullMarketDailySnapshot(options)
   },
   async startFullMarketHistorySync(options) {
     return startFullMarketHistorySync(options)
@@ -4673,17 +5399,20 @@ window.stockReviewBridge = {
   },
   async getFullMarketHistorySyncStatus() {
     ensureFullHistoryDir()
-    const combined = readCombinedFullHistoryItems()
-    if (combined.items.length && (!combined.index.exists || combined.index.readable)) {
-      fullHistoryJob.items = combined.items
-      fullHistoryJob.stockIndexFile = combined.index.filePath
-      fullHistoryJob.indexStartDate = combined.index.startDate
-      fullHistoryJob.indexEndDate = combined.index.endDate
-      fullHistoryJob.indexedStockCount = combined.index.rowsByCode.size
-      fullHistoryJob.missingStockCount = combined.items.filter(item => item.status === 'pending').length
-      if (fullHistoryJob.status === 'idle') {
-        fullHistoryJob.status = 'ready'
-        fullHistoryJob.message = `已合并快照清单与股票数据索引，共 ${combined.items.length} 只股票`
+    if (!isFullHistoryActive()) {
+      try {
+        const databaseStatus = await queryFullHistoryDatabaseStatus()
+        const items = applyDatabaseStatusToJob(databaseStatus, fullHistoryJob)
+        if (fullHistoryJob.status === 'idle') {
+          fullHistoryJob.status = items.length ? 'ready' : 'idle'
+          fullHistoryJob.message = items.length
+            ? `已从 SQLite 加载 ${items.length} 只股票及历史状态`
+            : 'SQLite 数据库中尚无股票快照'
+        }
+      } catch (error) {
+        if (!fullHistoryJob.items.length) {
+          fullHistoryJob.message = error.message || '读取 SQLite 数据库状态失败'
+        }
       }
     }
     return buildFullHistorySnapshot()
@@ -4692,16 +5421,14 @@ window.stockReviewBridge = {
     ensureFullHistoryDir()
     return {
       dataDir: FULL_HISTORY_DATA_DIR,
-      dailyDir: FULL_HISTORY_DAILY_DATA_DIR,
-      stockListFile: FULL_HISTORY_STOCK_LIST_FILE,
-      dateIndexFile: FULL_HISTORY_DATE_INDEX_FILE,
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
       snapshotExecutable: FULL_HISTORY_SNAPSHOT_EXECUTABLE,
-      snapshotCommand: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} --output ${FULL_HISTORY_STOCK_LIST_NAME} --source baostock`,
+      snapshotCommand: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} --database "${STOCK_REVIEW_DATABASE_NAME}" --source baostock`,
+      dailySnapshotExecutable: FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE,
+      dailySnapshotCommand: `${FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME} --database "${STOCK_REVIEW_DATABASE_NAME}" --date <快照日期> --source auto`,
       historyExecutable: FULL_HISTORY_EXECUTABLE,
       historyCommand: buildFullHistoryCommand('', ''),
-      calculateStockListFile: FULL_HISTORY_CALCULATE_STOCK_LIST_FILE,
-      outputDir: FULL_HISTORY_OUTPUT_DIR,
-      stockIndexFile: resolveFullHistoryStockIndexFile()
+      cleanupCommand: `${FULL_HISTORY_EXECUTABLE_NAME} --database "${STOCK_REVIEW_DATABASE_NAME}" --clear-history`
     }
   },
   getRuntimeInfo() {

@@ -174,7 +174,9 @@ function toStoredDataBundle(bundle) {
     historyRuleMode: bundle?.historyRuleMode || null,
     supportsBacktest: bundle?.supportsBacktest === true,
     sourceSize: Number(bundle?.sourceSize) || stocks.length,
-    resultLimit: bundle?.resultLimit ?? null
+    resultLimit: bundle?.resultLimit ?? null,
+    calculationRange: bundle?.calculationRange || null,
+    databaseFile: bundle?.databaseFile || ''
   }
 }
 
