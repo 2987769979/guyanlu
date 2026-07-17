@@ -264,6 +264,14 @@ code {
   align-items: center;
 }
 
+.result-data-source-grid {
+  display: grid;
+  grid-template-columns: minmax(360px, 1.1fr) minmax(320px, 1fr);
+  gap: 12px;
+  margin-top: 14px;
+  align-items: center;
+}
+
 .history-details-head {
   display: flex;
   align-items: center;
@@ -318,6 +326,10 @@ code {
 
 .history-status-filter {
   min-width: 140px !important;
+}
+
+.history-kline-count-filter {
+  width: 138px;
 }
 
 .full-history-output {
@@ -626,6 +638,10 @@ code {
   }
 
   .data-source-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .result-data-source-grid {
     grid-template-columns: 1fr;
   }
 

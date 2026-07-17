@@ -1,8 +1,9 @@
 const STORAGE_PREFIX = 'stock-review'
-const LATEST_DATA_SCHEMA_VERSION = 1
 
 export const STORAGE_KEYS = {
+  // 仅用于清理旧版本曾写入 uTools 的计算结果，不再用于新数据持久化。
   latestData: `${STORAGE_PREFIX}.cache.latest-data.v1`,
+  calculationHistory: `${STORAGE_PREFIX}.results.calculation-history.v1`,
   dataConfig: `${STORAGE_PREFIX}.settings.data-config`,
   strategy: `${STORAGE_PREFIX}.settings.strategy`,
   reviewNotes: `${STORAGE_PREFIX}.review.notes`,
@@ -157,58 +158,8 @@ export function removeStoredValue(key, legacyKeys = []) {
   })
 }
 
-// 缓存最新行情时只保留复盘需要的轻量字段，避免把原始行情全量塞进本地存储。
-function toStoredDataBundle(bundle) {
-  const stocks = Array.isArray(bundle?.stocks) ? bundle.stocks : []
-  return {
-    market: bundle?.market || null,
-    sectors: Array.isArray(bundle?.sectors) ? bundle.sectors : [],
-    stocks,
-    sourceLabel: bundle?.sourceLabel || '',
-    rawRows: [],
-    updatedAt: bundle?.updatedAt || null,
-    allMarketMode: Boolean(bundle?.allMarketMode),
-    historyMode: bundle?.historyMode || null,
-    historyScope: Number(bundle?.historyScope) || 0,
-    historyEnhanceError: bundle?.historyEnhanceError || null,
-    historyRuleMode: bundle?.historyRuleMode || null,
-    supportsBacktest: bundle?.supportsBacktest === true,
-    sourceSize: Number(bundle?.sourceSize) || stocks.length,
-    resultLimit: bundle?.resultLimit ?? null,
-    calculationRange: bundle?.calculationRange || null,
-    databaseFile: bundle?.databaseFile || ''
-  }
-}
-
-function isUsableDataBundle(value) {
-  return Boolean(
-    value &&
-    value.market &&
-    Array.isArray(value.sectors) &&
-    Array.isArray(value.stocks)
-  )
-}
-
-// 启动时恢复最近一次真实数据；格式不完整则返回空，让应用使用样例数据兜底。
-export function loadLatestDataBundle() {
-  const snapshot = readStoredValue(STORAGE_KEYS.latestData, null)
-  const bundle = snapshot?.bundle || snapshot
-  if (!isUsableDataBundle(bundle)) return null
-  return {
-    ...bundle,
-    rawRows: []
-  }
-}
-
-export function replaceLatestDataBundle(bundle) {
+// 计算结果已迁移到 stock-review.db；启动时清除旧版本遗留的大对象文档。
+export function clearLegacyCalculationResultStorage() {
   removeStoredValue(STORAGE_KEYS.latestData)
-  return writeStoredValue(STORAGE_KEYS.latestData, {
-    schemaVersion: LATEST_DATA_SCHEMA_VERSION,
-    savedAt: new Date().toISOString(),
-    bundle: toStoredDataBundle(bundle)
-  })
-}
-
-export function clearLatestDataBundle() {
-  removeStoredValue(STORAGE_KEYS.latestData)
+  removeStoredValue(STORAGE_KEYS.calculationHistory)
 }

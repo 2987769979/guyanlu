@@ -4,6 +4,7 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   Chip,
   Collapse,
   CssBaseline,
@@ -69,7 +70,7 @@ import TrendingDownIcon from '@mui/icons-material/TrendingDown'
 import TrendingUpIcon from '@mui/icons-material/TrendingUp'
 import TuneIcon from '@mui/icons-material/Tune'
 import WarningAmberIcon from '@mui/icons-material/WarningAmber'
-import { apiContractRows, backtestBenchmarks } from './sampleData'
+import { apiContractRows } from './sampleData'
 import {
   buildDataBundleFromIfindRows,
   createSampleDataBundle,
@@ -87,17 +88,14 @@ import {
   enrichStocks,
   formatAmount,
   formatPercent,
-  runBacktestFromSample,
   updateNestedValue
 } from './strategyEngine'
 import {
   LEGACY_STORAGE_KEYS,
   STORAGE_KEYS,
-  clearLatestDataBundle,
-  loadLatestDataBundle,
+  clearLegacyCalculationResultStorage,
   readStoredValue,
   removeStoredValue,
-  replaceLatestDataBundle,
   writeStoredValue
 } from './storage'
 
@@ -200,8 +198,24 @@ const EMPTY_HISTORY_SYNC_STATE = {
   failedTasks: [],
   errors: []
 }
+const EMPTY_TOP50_PERFORMANCE_STATE = {
+  loading: false,
+  records: [],
+  selectedId: '',
+  detail: null,
+  error: ''
+}
 const PORTFOLIO_QUOTE_REFRESH_MS = 15000
 const SHARE_LOT_SIZE = 100
+const HISTORY_TABLE_COLLATOR = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' })
+const HISTORY_STATUS_SORT_ORDER = {
+  pending: 0,
+  running: 1,
+  done: 2,
+  skipped: 3,
+  failed: 4,
+  not_applicable: 5
+}
 
 function localDateValue(date = new Date()) {
   const year = date.getFullYear()
@@ -212,6 +226,24 @@ function localDateValue(date = new Date()) {
 
 function historySecurityTypeLabel(value) {
   return HISTORY_SECURITY_TYPE_OPTIONS.find(item => item.value === value)?.label || '债券'
+}
+
+function compareHistoryTableRows(left, right, sortKey) {
+  if (sortKey === 'rowCount') return (Number(left.rowCount) || 0) - (Number(right.rowCount) || 0)
+  if (sortKey === 'updatedAt') {
+    const leftTime = left.updatedAt ? new Date(left.updatedAt).getTime() : 0
+    const rightTime = right.updatedAt ? new Date(right.updatedAt).getTime() : 0
+    return (Number.isFinite(leftTime) ? leftTime : 0) - (Number.isFinite(rightTime) ? rightTime : 0)
+  }
+  if (sortKey === 'securityType') {
+    return HISTORY_TABLE_COLLATOR.compare(historySecurityTypeLabel(left.securityType), historySecurityTypeLabel(right.securityType))
+  }
+  if (sortKey === 'status') {
+    return (HISTORY_STATUS_SORT_ORDER[left.status] ?? 99) - (HISTORY_STATUS_SORT_ORDER[right.status] ?? 99)
+  }
+  const leftValue = sortKey === 'name' ? left.name || left.code : sortKey === 'message' ? left.message || '' : left.code || ''
+  const rightValue = sortKey === 'name' ? right.name || right.code : sortKey === 'message' ? right.message || '' : right.code || ''
+  return HISTORY_TABLE_COLLATOR.compare(String(leftValue), String(rightValue))
 }
 
 const cloneStrategy = () => JSON.parse(JSON.stringify(DEFAULT_STRATEGY))
@@ -289,18 +321,23 @@ function loadInitialDataConfig() {
   }
 }
 
-function loadInitialDataBundle(dataConfig) {
-  if (dataConfig.source === 'sample') return createSampleDataBundle()
-  return loadLatestDataBundle() || createSampleDataBundle()
-}
-
-// 应用启动时同时准备数据源配置和首屏数据，保证后续状态初始化来自同一份配置。
+// 首屏先使用内置本地数据，随后异步从 SQLite 恢复最新一次计算结果。
 function createInitialAppState() {
   const dataConfig = loadInitialDataConfig()
+  const localDataBundle = createSampleDataBundle()
   return {
     dataConfig,
-    dataBundle: loadInitialDataBundle(dataConfig)
+    localDataBundle,
+    calculationHistory: [],
+    selectedDataSource: 'local',
+    dataBundle: localDataBundle
   }
+}
+
+function formatCalculationTime(value) {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return '时间未知'
+  return date.toLocaleString('zh-CN', { hour12: false })
 }
 
 // 实时行情会覆盖同一股票同一日期的历史行，让页面优先展示最新价格。
@@ -442,10 +479,6 @@ function getPoolMode(dataBundle) {
   return (dataBundle.historyMode === 'enhanced' || dataBundle.historyMode === 'history') && historyRatio >= 0.35
     ? 'history'
     : 'snapshot'
-}
-
-function canRunReturnBacktest(dataBundle) {
-  return dataBundle.supportsBacktest === true
 }
 
 // 全市场扫描先拿快照，再给排名靠前的股票补历史K线，提升评分和图表的可信度。
@@ -638,11 +671,24 @@ export default function App() {
   const [activePage, setActivePage] = useState('review')
   const [strategy, setStrategy] = useState(loadStrategy)
   const [dataConfig, setDataConfig] = useState(initialAppState.dataConfig)
+  const localDataBundle = initialAppState.localDataBundle
+  const [calculationHistory, setCalculationHistory] = useState(initialAppState.calculationHistory)
+  const [calculationHistoryStatus, setCalculationHistoryStatus] = useState({
+    loading: true,
+    error: '',
+    queriedAt: null
+  })
+  const [calculationDeleteBusy, setCalculationDeleteBusy] = useState(false)
+  const [selectedDataSource, setSelectedDataSource] = useState(initialAppState.selectedDataSource)
   const [dataBundle, setDataBundle] = useState(initialAppState.dataBundle)
+  const calculationResultCacheRef = useRef(new Map())
+  const calculationInteractionVersionRef = useRef(0)
   const [historySync, setHistorySync] = useState(EMPTY_HISTORY_SYNC_STATE)
   const [historySyncBusy, setHistorySyncBusy] = useState(false)
   const [historySyncAction, setHistorySyncAction] = useState(null)
   const [historyOverlapRequest, setHistoryOverlapRequest] = useState(null)
+  const [top50Performance, setTop50Performance] = useState(EMPTY_TOP50_PERFORMANCE_STATE)
+  const top50PerformanceRequestRef = useRef(0)
   const [historySyncForm, setHistorySyncForm] = useState(() => ({
     startDate: initialAppState.dataConfig.startDate,
     endDate: initialAppState.dataConfig.endDate,
@@ -671,7 +717,7 @@ export default function App() {
   })
   const [transactions, setTransactions] = useState(() => loadJsonArray(STORAGE_KEYS.transactions))
   const [positionPrefill, setPositionPrefill] = useState(null)
-  const [statusInfo, setStatusInfo] = useState(() => createStatus('等待从本地 SQLite 计算'))
+  const [statusInfo, setStatusInfo] = useState(() => createStatus('正在检查 SQLite 中的最近计算结果...'))
   const status = statusInfo.message
   const updateStatus = (value, detail = '') => setStatusInfo(createStatus(value, detail))
   const setStatus = updateStatus
@@ -680,34 +726,30 @@ export default function App() {
   const activeMarket = dataBundle.market
   const activeSectors = dataBundle.sectors
   const activeStocks = dataBundle.stocks
+  const selectedCalculation = useMemo(
+    () => calculationHistory.find(item => String(item.id) === String(selectedDataSource)) || null,
+    [calculationHistory, selectedDataSource]
+  )
+  const displayStrategy = selectedCalculation?.strategy || strategy
 
   // 所有页面共享同一批评分结果，避免每个页面重复跑策略引擎。
   const scoredStocks = useMemo(() => {
-    const scored = enrichStocks(activeStocks, activeSectors, activeMarket, strategy)
+    const scored = enrichStocks(activeStocks, activeSectors, activeMarket, displayStrategy)
     return scored
-  }, [activeStocks, activeSectors, activeMarket, strategy, dataBundle.allMarketMode])
+  }, [activeStocks, activeSectors, activeMarket, displayStrategy, dataBundle.allMarketMode])
   const displaySectors = useMemo(() => {
     if (!dataBundle.allMarketMode) return activeSectors
     return buildDisplaySectorsFromStocks(scoredStocks)
   }, [activeSectors, scoredStocks, dataBundle.allMarketMode])
   const poolMode = getPoolMode(dataBundle)
   const pools = useMemo(
-    () => buildPools(scoredStocks, strategy, activeMarket, { mode: poolMode }),
-    [scoredStocks, strategy, activeMarket, poolMode]
+    () => buildPools(scoredStocks, displayStrategy, activeMarket, { mode: poolMode }),
+    [scoredStocks, displayStrategy, activeMarket, poolMode]
   )
   const review = useMemo(
     () => buildReview(scoredStocks, pools, activeMarket, displaySectors),
     [scoredStocks, pools, activeMarket, displaySectors]
   )
-  const backtest = useMemo(() => {
-    const rows = pools.broad.length ? pools.broad : scoredStocks.slice(0, ALL_MARKET_TOP_LIMIT)
-    return {
-      ...runBacktestFromSample(rows, strategy),
-      available: canRunReturnBacktest(dataBundle),
-      dataMode: dataBundle.historyMode || 'history'
-    }
-  }, [pools, scoredStocks, strategy, dataBundle])
-
   const selectedStock = scoredStocks.find(stock => stock.code === selectedStockCode) || scoredStocks[0]
   const topRankedRows = scoredStocks.slice(0, ALL_MARKET_TOP_LIMIT)
   const selectedPoolRows = selectedPool === TOP_RANKED_POOL_ID ? topRankedRows : (pools[selectedPool] || [])
@@ -733,6 +775,64 @@ export default function App() {
   useEffect(() => {
     saveDataConfig(dataConfig)
   }, [dataConfig])
+
+  // 计算历史只存 SQLite。启动时清掉旧版 uTools 大对象，再按“索引 -> 最新详情”两步恢复首屏。
+  useEffect(() => {
+    clearLegacyCalculationResultStorage()
+    const bridge = window.stockReviewBridge
+    if (!bridge?.listCalculationResultsFromSqlite || !bridge?.readCalculationResultFromSqlite) {
+      setCalculationHistoryStatus({
+        loading: false,
+        error: '当前环境无法读取 SQLite 计算历史',
+        queriedAt: new Date().toISOString()
+      })
+      setStatus('当前环境无法读取 SQLite 计算历史，已显示本地样例数据')
+      return undefined
+    }
+
+    let cancelled = false
+    const restoreVersion = calculationInteractionVersionRef.current
+    const restoreLatestCalculation = async () => {
+      try {
+        setCalculationHistoryStatus(current => ({ ...current, loading: true, error: '' }))
+        const indexResult = await bridge.listCalculationResultsFromSqlite()
+        if (cancelled) return
+        const records = Array.isArray(indexResult?.records) ? indexResult.records : []
+        setCalculationHistory(records)
+        setCalculationHistoryStatus({ loading: false, error: '', queriedAt: new Date().toISOString() })
+        if (!records.length) {
+          if (calculationInteractionVersionRef.current === restoreVersion) {
+            setStatus('SQLite 中暂无历史计算结果，当前显示本地样例数据')
+          }
+          return
+        }
+        if (calculationInteractionVersionRef.current !== restoreVersion) return
+
+        const latest = records[0]
+        const detail = await bridge.readCalculationResultFromSqlite({ calculationId: latest.id })
+        if (cancelled || calculationInteractionVersionRef.current !== restoreVersion) return
+        if (!detail?.bundle?.market || !Array.isArray(detail.bundle.stocks)) {
+          throw new Error('SQLite 最新计算记录的数据结构不完整')
+        }
+        calculationResultCacheRef.current.set(String(latest.id), detail)
+        setSelectedDataSource(String(latest.id))
+        setDataBundle(detail.bundle)
+        if (detail.bundle.stocks[0]) setSelectedStockCode(detail.bundle.stocks[0].code)
+        setStatus(`已从 SQLite 加载最近计算结果：${formatCalculationTime(latest.savedAt)}`)
+      } catch (error) {
+        if (!cancelled) {
+          setCalculationHistoryStatus({
+            loading: false,
+            error: error.message || '查询 SQLite 计算记录失败',
+            queriedAt: new Date().toISOString()
+          })
+          setStatus(error.message || '读取 SQLite 计算历史失败，已显示本地样例数据', errorDetail(error, '读取 SQLite 计算历史失败'))
+        }
+      }
+    }
+    restoreLatestCalculation()
+    return () => { cancelled = true }
+  }, [])
 
   // 持仓页打开后定时拉取快照报价，只在数据变化时刷新状态，减少无意义重渲染。
   useEffect(() => {
@@ -878,6 +978,11 @@ export default function App() {
   }, [activePage])
 
   useEffect(() => {
+    if (activePage !== 'backtest') return
+    refreshTop50Performance('', { silent: true })
+  }, [activePage])
+
+  useEffect(() => {
     if (!historySyncActive) return undefined
     let cancelled = false
     const poll = async () => {
@@ -899,13 +1004,170 @@ export default function App() {
       return null
     }
     try {
-      const snapshot = await bridge.getFullMarketHistorySyncStatus()
+      const snapshot = await bridge.getFullMarketHistorySyncStatus({
+        throwOnDatabaseError: Boolean(options.throwOnDatabaseError)
+      })
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
       if (!options.silent && snapshot?.message) setStatus(snapshot.message, snapshot.databaseFile || snapshot.message)
       return snapshot
     } catch (error) {
       if (!options.silent) setStatus(error.message || '读取历史同步状态失败', errorDetail(error, '读取历史同步状态失败'))
       return null
+    }
+  }
+
+  async function refreshCalculationHistoryIndex(options = {}) {
+    const bridge = window.stockReviewBridge
+    if (!bridge?.listCalculationResultsFromSqlite) {
+      const message = '当前环境不支持查询 SQLite 计算记录'
+      setCalculationHistoryStatus({ loading: false, error: message, queriedAt: new Date().toISOString() })
+      if (!options.silent) setStatus(message)
+      return []
+    }
+
+    setCalculationHistoryStatus(current => ({ ...current, loading: true, error: '' }))
+    try {
+      const result = await bridge.listCalculationResultsFromSqlite()
+      const records = Array.isArray(result?.records) ? result.records : []
+      setCalculationHistory(records)
+      setCalculationHistoryStatus({ loading: false, error: '', queriedAt: new Date().toISOString() })
+      if (!options.silent) {
+        setStatus(
+          records.length
+            ? `已从 SQLite 查询到 ${records.length} 条计算记录`
+            : 'SQLite 中暂无历史计算结果'
+        )
+      }
+      return records
+    } catch (error) {
+      const message = error.message || '查询 SQLite 计算记录失败'
+      setCalculationHistoryStatus({ loading: false, error: message, queriedAt: new Date().toISOString() })
+      if (!options.silent) setStatus(message, errorDetail(error, '查询 SQLite 计算记录失败'))
+      return []
+    }
+  }
+
+  async function handleDeleteCalculationRecord(record) {
+    const calculationId = String(record?.id || '')
+    const bridge = window.stockReviewBridge
+    if (!calculationId || !bridge?.deleteCalculationResultFromSqlite) {
+      setStatus('当前环境不支持删除 SQLite 计算记录')
+      return false
+    }
+
+    try {
+      setCalculationDeleteBusy(true)
+      const result = await bridge.deleteCalculationResultFromSqlite({ calculationId })
+      const records = Array.isArray(result?.records) ? result.records : []
+      setCalculationHistory(records)
+      setCalculationHistoryStatus({ loading: false, error: '', queriedAt: new Date().toISOString() })
+      calculationResultCacheRef.current.delete(calculationId)
+
+      if (String(selectedDataSource) === calculationId) {
+        calculationInteractionVersionRef.current += 1
+        setSelectedDataSource('local')
+        setDataBundle(localDataBundle)
+        if (localDataBundle.stocks[0]) setSelectedStockCode(localDataBundle.stocks[0].code)
+      }
+
+      const deletedTrackingIds = new Set(
+        (Array.isArray(result?.deletedTrackingIds) ? result.deletedTrackingIds : []).map(String)
+      )
+      if (deletedTrackingIds.size) {
+        setTop50Performance(current => {
+          const nextRecords = current.records.filter(item => !deletedTrackingIds.has(String(item.id)))
+          const selectedDeleted = deletedTrackingIds.has(String(current.selectedId))
+          return {
+            ...current,
+            records: nextRecords,
+            selectedId: selectedDeleted ? '' : current.selectedId,
+            detail: selectedDeleted ? null : current.detail
+          }
+        })
+      }
+
+      setStatus(
+        `已删除 ${formatCalculationTime(record.savedAt)} 的 SQLite 计算记录`,
+        `计算批次 ${calculationId}、逐股结果、板块结果${deletedTrackingIds.size ? `及 ${deletedTrackingIds.size} 个关联 Top50 跟踪批次` : ''}已删除`
+      )
+      return true
+    } catch (error) {
+      const message = error.message || '删除 SQLite 计算记录失败'
+      setCalculationHistoryStatus(current => ({ ...current, error: message }))
+      setStatus(message, errorDetail(error, '删除 SQLite 计算记录失败'))
+      return false
+    } finally {
+      setCalculationDeleteBusy(false)
+    }
+  }
+
+  async function refreshTop50Performance(preferredId = '', options = {}) {
+    const bridge = window.stockReviewBridge
+    if (!bridge?.refreshTop50PerformanceFromSqlite || !bridge?.readTop50PerformanceFromSqlite) {
+      const message = '当前环境不支持从 SQLite 读取 Top50 五日跟踪'
+      setTop50Performance(current => ({ ...current, loading: false, error: message }))
+      if (!options.silent) setStatus(message)
+      return null
+    }
+
+    const requestId = ++top50PerformanceRequestRef.current
+    setTop50Performance(current => ({ ...current, loading: true, error: '' }))
+    try {
+      const response = await bridge.refreshTop50PerformanceFromSqlite({
+        trackingId: options.refreshSelectedOnly ? preferredId : '',
+        force: Boolean(options.force)
+      })
+      const records = Array.isArray(response?.records) ? response.records : []
+      const currentId = String(preferredId || top50Performance.selectedId || '')
+      const selectedId = records.some(item => String(item.id) === currentId)
+        ? currentId
+        : String(records[0]?.id || '')
+      const detail = selectedId
+        ? await bridge.readTop50PerformanceFromSqlite({ trackingId: selectedId })
+        : null
+      if (requestId !== top50PerformanceRequestRef.current) return null
+      setTop50Performance({ loading: false, records, selectedId, detail, error: '' })
+      if (!options.silent) {
+        const completed = records.filter(item => item.status === 'completed').length
+        const partial = records.filter(item => item.status === 'partial').length
+        setStatus(`Top50 五日跟踪已刷新：${records.length} 个批次，${partial} 个阶段结果，${completed} 个五日结果`)
+      }
+      return detail
+    } catch (error) {
+      if (requestId !== top50PerformanceRequestRef.current) return null
+      const message = error.message || '刷新 Top50 五日跟踪失败'
+      setTop50Performance(current => ({ ...current, loading: false, error: message }))
+      if (!options.silent) setStatus(message, errorDetail(error, '刷新 Top50 五日跟踪失败'))
+      return null
+    }
+  }
+
+  async function handleSelectTop50Performance(trackingId) {
+    const id = String(trackingId || '')
+    const bridge = window.stockReviewBridge
+    if (!id || !bridge?.readTop50PerformanceFromSqlite) return
+    const requestId = ++top50PerformanceRequestRef.current
+    setTop50Performance(current => ({ ...current, loading: true, selectedId: id, detail: null, error: '' }))
+    try {
+      const detail = await bridge.readTop50PerformanceFromSqlite({ trackingId: id })
+      if (requestId !== top50PerformanceRequestRef.current) return
+      setTop50Performance(current => ({ ...current, loading: false, selectedId: id, detail, error: '' }))
+    } catch (error) {
+      if (requestId !== top50PerformanceRequestRef.current) return
+      setTop50Performance(current => ({ ...current, loading: false, error: error.message || '读取 Top50 跟踪详情失败' }))
+    }
+  }
+
+  async function handleRefreshFullHistoryDatabaseDisplay() {
+    try {
+      setHistorySyncBusy(true)
+      const snapshot = await refreshFullHistoryStatus({ throwOnDatabaseError: true })
+      if (snapshot) {
+        const itemCount = Array.isArray(snapshot.items) ? snapshot.items.length : 0
+        setStatus(`已从 SQLite 数据库刷新 ${itemCount} 只证券的历史数据显示`, snapshot.databaseFile || '')
+      }
+    } finally {
+      setHistorySyncBusy(false)
     }
   }
 
@@ -1008,6 +1270,7 @@ export default function App() {
           snapshot?.databaseFile || ''
         ].filter(Boolean).join('；')
       )
+      await refreshTop50Performance('', { silent: true })
     } catch (error) {
       setStatus(error.message || '每日快照入库失败', errorDetail(error, '每日快照入库失败'))
     } finally {
@@ -1055,23 +1318,33 @@ export default function App() {
     }
   }
 
-  async function handleStartFullHistorySync() {
+  async function handleStartFullHistorySync(selectedCodes = []) {
     const bridge = window.stockReviewBridge
     if (!bridge?.startFullMarketHistorySync) {
       setStatus('当前环境不支持全市场历史数据同步，请在 uTools/Electron 中运行')
       return
     }
+    const normalizedSelectedCodes = Array.from(new Set(
+      (Array.isArray(selectedCodes) ? selectedCodes : []).map(code => String(code || '').trim()).filter(Boolean)
+    ))
     try {
       setHistorySyncBusy(true)
       const snapshot = await bridge.startFullMarketHistorySync({
         startDate: historySyncForm.startDate,
-        endDate: historySyncForm.endDate
+        endDate: historySyncForm.endDate,
+        selectedCodes: normalizedSelectedCodes
       })
       setHistorySync(snapshot || EMPTY_HISTORY_SYNC_STATE)
       setHistoryOverlapRequest(snapshot?.hasDateOverlap ? snapshot : null)
-      setStatus(snapshot?.message || '全市场历史数据同步已开始', snapshot?.databaseFile || snapshot?.historyExecutable || '')
+      setStatus(
+        snapshot?.message || (normalizedSelectedCodes.length
+          ? `已开始获取 ${normalizedSelectedCodes.length} 只选中股票的历史数据`
+          : '全市场历史数据同步已开始'),
+        snapshot?.databaseFile || snapshot?.historyExecutable || ''
+      )
     } catch (error) {
-      setStatus(error.message || '启动全市场历史数据同步失败', errorDetail(error, '启动全市场历史数据同步失败'))
+      const fallbackMessage = normalizedSelectedCodes.length ? '启动选中股票历史数据获取失败' : '启动全市场历史数据同步失败'
+      setStatus(error.message || fallbackMessage, errorDetail(error, fallbackMessage))
     } finally {
       setHistorySyncBusy(false)
     }
@@ -1089,7 +1362,48 @@ export default function App() {
     }
   }
 
-  // 顶部刷新与策略页运行都只读取本地 SQLite，按日期过滤后计算并持久化到 uTools。
+  // “本地数据源”始终指向内置兜底数据；历史选项按需从 SQLite 还原完整计算快照。
+  const handleDisplayDataSourceChange = async nextSource => {
+    const requestVersion = calculationInteractionVersionRef.current + 1
+    calculationInteractionVersionRef.current = requestVersion
+    if (nextSource === 'local') {
+      setSelectedDataSource('local')
+      setDataBundle(localDataBundle)
+      if (localDataBundle.stocks[0]) setSelectedStockCode(localDataBundle.stocks[0].code)
+      setStatus('已切换为本地数据源，选股结果、板块、回测和风险页面已同步更新')
+      return
+    }
+
+    const sourceId = String(nextSource)
+    const record = calculationHistory.find(item => String(item.id) === sourceId)
+    if (!record) {
+      setStatus('所选计算记录不存在，已保留当前显示数据')
+      return
+    }
+
+    try {
+      setStatus(`正在从 SQLite 加载 ${formatCalculationTime(record.savedAt)} 的计算结果...`)
+      let detail = calculationResultCacheRef.current.get(sourceId)
+      if (!detail) {
+        const bridge = window.stockReviewBridge
+        if (!bridge?.readCalculationResultFromSqlite) throw new Error('当前环境不支持读取 SQLite 计算结果')
+        detail = await bridge.readCalculationResultFromSqlite({ calculationId: sourceId })
+        calculationResultCacheRef.current.set(sourceId, detail)
+      }
+      if (calculationInteractionVersionRef.current !== requestVersion) return
+      if (!detail?.bundle?.market || !Array.isArray(detail.bundle.stocks)) {
+        throw new Error('SQLite 计算记录的数据结构不完整')
+      }
+      setSelectedDataSource(sourceId)
+      setDataBundle(detail.bundle)
+      if (detail.bundle.stocks[0]) setSelectedStockCode(detail.bundle.stocks[0].code)
+      setStatus(`已切换为 ${formatCalculationTime(record.savedAt)} 的 SQLite 计算结果，所有结果页已同步更新`)
+    } catch (error) {
+      setStatus(error.message || '读取 SQLite 计算结果失败', errorDetail(error, '读取 SQLite 计算结果失败'))
+    }
+  }
+
+  // 顶部刷新与策略页运行都只读取本地 SQLite，并把完整计算结果写回同一个数据库。
   const handleRefreshData = async (nextConfig = dataConfig, options = {}) => {
     const startDate = String(nextConfig?.startDate || '').trim()
     const endDate = String(nextConfig?.endDate || '').trim()
@@ -1110,7 +1424,9 @@ export default function App() {
       return
     }
 
+    let currentStep = '从 SQLite 读取待计算数据'
     try {
+      calculationInteractionVersionRef.current += 1
       setIsRefreshing(true)
       if (!options.silent) setStatus(`正在读取 SQLite 并计算 ${startDate} 至 ${endDate} 的 A 股数据...`)
       const result = await bridge.readStockHistoryFromSqlite({ startDate, endDate })
@@ -1136,12 +1452,32 @@ export default function App() {
         calculationRange: { startDate, endDate },
         databaseFile: result.databaseFile || ''
       }
-      if (!replaceLatestDataBundle(nextBundle)) throw new Error('计算完成，但结果写入本地存储失败')
+      currentStep = '将计算结果写入 SQLite'
+      if (!bridge.saveCalculationResultToSqlite) throw new Error('当前环境不支持写入 SQLite 计算结果')
+      const savedResult = await bridge.saveCalculationResultToSqlite({
+        bundle: nextBundle,
+        strategy,
+        savedAt: new Date().toISOString()
+      })
+      if (!savedResult?.record) throw new Error('SQLite 未返回已保存的计算记录')
+      const savedRecords = Array.isArray(savedResult.records) ? savedResult.records : [savedResult.record]
+      setCalculationHistory(savedRecords)
+      const savedId = String(savedResult.record.id)
+      calculationResultCacheRef.current.set(savedId, {
+        record: savedResult.record,
+        strategy,
+        bundle: nextBundle
+      })
+      const retainedIds = new Set(savedRecords.map(item => String(item.id)))
+      calculationResultCacheRef.current.forEach((value, key) => {
+        if (!retainedIds.has(String(key))) calculationResultCacheRef.current.delete(key)
+      })
+      setSelectedDataSource(savedId)
       setDataBundle(nextBundle)
       if (calculatedStocks[0]) setSelectedStockCode(calculatedStocks[0].code)
 
-      const storageLabel = window.utools?.dbStorage ? 'uTools dbStorage' : '浏览器 localStorage'
-      const finalStatus = `SQLite 计算完成：${calculatedStocks.length} 只 A 股，结果已写入 ${storageLabel}`
+      const trackingText = savedResult.top50TrackingId ? '，已建立 Top50 五日跟踪' : ''
+      const finalStatus = `SQLite 计算完成：${calculatedStocks.length} 只 A 股，结果已写入 SQLite（保留最近 ${savedRecords.length}/5 次）${trackingText}`
       setStatus(finalStatus, [
         finalStatus,
         `日期范围：${startDate} 至 ${endDate}`,
@@ -1150,7 +1486,8 @@ export default function App() {
         '过滤规则：仅沪深北 A 股代码，已排除指数、ETF、债券和新债'
       ].join('\n'))
     } catch (error) {
-      setStatus(error.message || 'SQLite 计算失败', errorDetail(error, 'SQLite 计算失败'))
+      const fallbackMessage = `${currentStep}失败`
+      setStatus(error.message || fallbackMessage, errorDetail(error, fallbackMessage))
     } finally {
       setIsRefreshing(false)
     }
@@ -1159,7 +1496,6 @@ export default function App() {
   // 旧的数据源获取逻辑仅保留作历史兼容，不再由页面按钮调用。
   const handleRefreshDataLegacy = async (nextConfig = dataConfig, options = {}) => {
     if (nextConfig.source === 'sample') {
-      clearLatestDataBundle()
       setDataBundle(createSampleDataBundle())
       setStatus('已切换为本地样例数据')
       return
@@ -1316,7 +1652,6 @@ export default function App() {
           setStatus
         })
       }
-      replaceLatestDataBundle(nextBundle)
       setDataBundle(nextBundle)
       const firstStock = isAllMarketMode
         ? enrichStocks(nextBundle.stocks, nextBundle.sectors, nextBundle.market, strategy)[0]
@@ -1582,7 +1917,7 @@ export default function App() {
             <Box>
               <Typography variant='subtitle1' fontWeight={800}>A股量能复盘</Typography>
               <Typography variant='caption' color='text.secondary'>
-                {dataBundle.sourceLabel} · 策略 {strategy.version}
+                {dataBundle.sourceLabel} · 策略 {displayStrategy.version}
               </Typography>
             </Box>
           </Box>
@@ -1711,6 +2046,13 @@ export default function App() {
               onRefreshData={() => handleRefreshData(dataConfig)}
               isRefreshing={isRefreshing}
               dataBundle={dataBundle}
+              calculationHistory={calculationHistory}
+              calculationHistoryStatus={calculationHistoryStatus}
+              selectedDataSource={selectedDataSource}
+              onDisplayDataSourceChange={handleDisplayDataSourceChange}
+              onRefreshCalculationHistory={refreshCalculationHistoryIndex}
+              calculationDeleteBusy={calculationDeleteBusy}
+              onDeleteCalculationRecord={handleDeleteCalculationRecord}
             />
           )}
           {activePage === 'historySync' && (
@@ -1725,17 +2067,21 @@ export default function App() {
               onRefreshStockList={handleRefreshFullMarketStockSnapshot}
               onFetchDailySnapshot={handleFetchFullMarketDailySnapshot}
               onStart={handleStartFullHistorySync}
+              onStartSelected={handleStartFullHistorySync}
               onStop={handleStopFullHistorySync}
-              onRefresh={() => refreshFullHistoryStatus()}
+              onRefresh={handleRefreshFullHistoryDatabaseDisplay}
               overlapRequest={historyOverlapRequest}
               onDismissOverlap={() => setHistoryOverlapRequest(null)}
             />
           )}
           {activePage === 'backtest' && (
             <BacktestPage
-              backtest={backtest}
-              benchmarks={backtestBenchmarks}
-              strategy={strategy}
+              performance={top50Performance}
+              onRefresh={() => refreshTop50Performance(top50Performance.selectedId, {
+                force: true,
+                refreshSelectedOnly: Boolean(top50Performance.selectedId)
+              })}
+              onSelectRun={handleSelectTop50Performance}
             />
           )}
           {activePage === 'risk' && (
@@ -2214,14 +2560,36 @@ function StrategyPage({
   onDataConfigChange,
   onRefreshData,
   isRefreshing,
-  dataBundle
+  dataBundle,
+  calculationHistory,
+  calculationHistoryStatus,
+  selectedDataSource,
+  onDisplayDataSourceChange,
+  onRefreshCalculationHistory,
+  calculationDeleteBusy,
+  onDeleteCalculationRecord
 }) {
+  const [dataSourceMenuOpen, setDataSourceMenuOpen] = useState(false)
+  const [deleteRecord, setDeleteRecord] = useState(null)
   const weightSum = Object.values(strategy.weights).reduce((sum, item) => sum + item, 0)
   const setValue = (path, value) => onStrategyChange(current => updateNestedValue(current, path, value))
   const setDataValue = (key, value) => onDataConfigChange(current => ({ ...current, [key]: value }))
+  const selectedRecord = calculationHistory.find(item => String(item.id) === String(selectedDataSource)) || null
   const scopeLabel = dataBundle.allMarketMode
     ? ` · 全市场${dataBundle.sourceSize || dataBundle.stocks?.length || 0}只 · 默认Top${dataBundle.resultLimit || ALL_MARKET_TOP_LIMIT}`
     : ''
+  const calculationRecordLabel = (record, index) => {
+    const range = record?.calculationRange
+    const rangeText = range?.startDate && range?.endDate
+      ? ` · ${range.startDate} 至 ${range.endDate}`
+      : ''
+    return `最近第 ${index + 1} 次 · ${formatCalculationTime(record?.savedAt)}${rangeText} · ${record?.stockCount || 0} 只`
+  }
+  const handleConfirmDeleteRecord = async () => {
+    if (!deleteRecord) return
+    const deleted = await onDeleteCalculationRecord(deleteRecord)
+    if (deleted) setDeleteRecord(null)
+  }
   const thresholdRows = [
     ['最低综合分', 'thresholds.minScore', 40, 90, 1, strategy.thresholds.minScore],
     ['最大风险扣分', 'thresholds.maxRiskPenalty', 0, 50, 1, strategy.thresholds.maxRiskPenalty],
@@ -2248,6 +2616,141 @@ function StrategyPage({
           </Stack>
         )}
       />
+
+      <Paper className='panel' variant='outlined'>
+        <Box className='panel-head'>
+          <Box>
+            <Typography variant='subtitle2' fontWeight={800}>页面显示数据源</Typography>
+            <Typography variant='caption' color='text.secondary'>
+              切换后，选股结果、板块强弱、回测分析、风险观察及市场复盘会使用同一份数据。
+            </Typography>
+          </Box>
+          <Chip
+            size='small'
+            color={selectedRecord ? 'primary' : 'default'}
+            label={selectedRecord ? 'SQLite 计算记录' : '本地数据源'}
+            variant='outlined'
+          />
+        </Box>
+        <Box className='result-data-source-grid'>
+          <Stack direction='row' spacing={1} alignItems='center'>
+            <FormControl size='small' fullWidth>
+              <InputLabel id='result-data-source-label'>显示数据源</InputLabel>
+              <Select
+                labelId='result-data-source-label'
+                label='显示数据源'
+                value={selectedDataSource}
+                open={dataSourceMenuOpen}
+                onOpen={() => setDataSourceMenuOpen(true)}
+                onClose={() => setDataSourceMenuOpen(false)}
+                onChange={event => onDisplayDataSourceChange(event.target.value)}
+                renderValue={value => {
+                  if (value === 'local') return '本地数据源（内置样例）'
+                  const index = calculationHistory.findIndex(item => String(item.id) === String(value))
+                  return index >= 0 ? calculationRecordLabel(calculationHistory[index], index) : '所选 SQLite 计算记录不存在'
+                }}
+              >
+                <MenuItem value='local'>本地数据源（内置样例）</MenuItem>
+                {calculationHistoryStatus.loading && !calculationHistory.length && (
+                  <MenuItem disabled value='database-loading'>正在查询 SQLite 计算记录...</MenuItem>
+                )}
+                {calculationHistory.map((record, index) => {
+                  return (
+                    <MenuItem key={record.id} value={String(record.id)} sx={{ gap: 1, pr: 0.5 }}>
+                      <Box component='span' sx={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {calculationRecordLabel(record, index)}
+                      </Box>
+                      <Tooltip title='删除这条 SQLite 计算记录'>
+                        <IconButton
+                          component='span'
+                          size='small'
+                          color='error'
+                          aria-label={`删除最近第 ${index + 1} 次计算记录`}
+                          disabled={calculationDeleteBusy}
+                          onMouseDown={event => {
+                            event.preventDefault()
+                            event.stopPropagation()
+                          }}
+                          onClick={event => {
+                            event.preventDefault()
+                            event.stopPropagation()
+                            setDataSourceMenuOpen(false)
+                            setDeleteRecord(record)
+                          }}
+                        >
+                          <DeleteOutlineIcon fontSize='small' />
+                        </IconButton>
+                      </Tooltip>
+                    </MenuItem>
+                  )
+                })}
+              </Select>
+            </FormControl>
+            <Tooltip title='重新查询 SQLite 计算记录'>
+              <span>
+                <IconButton
+                  color='primary'
+                  disabled={calculationHistoryStatus.loading}
+                  onClick={() => onRefreshCalculationHistory()}
+                >
+                  <SyncIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+          <Alert
+            severity={calculationHistoryStatus.error ? 'error' : selectedRecord ? 'success' : 'info'}
+            sx={{ py: 0, alignItems: 'center' }}
+          >
+            {calculationHistoryStatus.loading
+              ? '正在从 SQLite 查询最近五次计算记录...'
+              : calculationHistoryStatus.error
+                ? `SQLite 查询失败：${calculationHistoryStatus.error}`
+                : selectedRecord
+                  ? `当前显示 ${formatCalculationTime(selectedRecord.savedAt)} 的计算快照；SQLite 共查询到 ${calculationHistory.length} 条记录。`
+                  : calculationHistory.length
+                    ? `SQLite 已查询到 ${calculationHistory.length} 条计算记录；当前手动显示本地样例，可从下拉框切换。`
+                    : 'SQLite 中暂无计算记录，当前使用本地样例数据兜底。'}
+          </Alert>
+        </Box>
+        <Stack direction='row' spacing={1} mt={1.5} flexWrap='wrap' useFlexGap>
+          {['选股结果', '板块强弱', '回测分析', '风险观察'].map(label => (
+            <Chip key={label} size='small' label={label} variant='outlined' />
+          ))}
+        </Stack>
+      </Paper>
+
+      <Dialog
+        open={Boolean(deleteRecord)}
+        onClose={() => { if (!calculationDeleteBusy) setDeleteRecord(null) }}
+        maxWidth='sm'
+        fullWidth
+      >
+        <DialogTitle>删除 SQLite 计算记录</DialogTitle>
+        <DialogContent>
+          <Alert severity='warning' sx={{ mb: 2 }}>
+            此操作会永久删除该批次的计算结果，无法撤销。
+          </Alert>
+          <Typography variant='body2'>
+            记录时间：{formatCalculationTime(deleteRecord?.savedAt)}
+          </Typography>
+          <Typography variant='body2' color='text.secondary' sx={{ mt: 1 }}>
+            将同步删除逐股结果、板块结果以及该计算批次关联的 Top50 跟踪数据。
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={calculationDeleteBusy} onClick={() => setDeleteRecord(null)}>取消</Button>
+          <Button
+            color='error'
+            variant='contained'
+            startIcon={<DeleteOutlineIcon />}
+            disabled={calculationDeleteBusy}
+            onClick={handleConfirmDeleteRecord}
+          >
+            {calculationDeleteBusy ? '正在删除...' : '确认删除'}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Paper className='panel' variant='outlined'>
         <Box className='panel-head'>
@@ -2282,7 +2785,7 @@ function StrategyPage({
             {isRefreshing ? '计算中' : '从 SQLite 计算'}
           </Button>
           <Alert severity='info' sx={{ py: 0, alignItems: 'center' }}>
-            仅计算沪深北 A 股；指数、ETF、债券和新债会在 SQLite 查询阶段被排除，结果保存到 uTools。
+            仅计算沪深北 A 股；指数、ETF、债券和新债会在 SQLite 查询阶段被排除，结果直接保存到 stock-review.db。
           </Alert>
         </Stack>
       </Paper>
@@ -2361,6 +2864,7 @@ function HistorySyncPage({
   onRefreshStockList,
   onFetchDailySnapshot,
   onStart,
+  onStartSelected,
   onStop,
   onRefresh,
   overlapRequest,
@@ -2390,6 +2894,11 @@ function HistorySyncPage({
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
   const [securityTypeFilter, setSecurityTypeFilter] = useState('all')
+  const [minKLineCount, setMinKLineCount] = useState('')
+  const [maxKLineCount, setMaxKLineCount] = useState('')
+  const [selectedCodes, setSelectedCodes] = useState(() => new Set())
+  const [sortKey, setSortKey] = useState('code')
+  const [sortDirection, setSortDirection] = useState('asc')
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(20)
   const [jumpPage, setJumpPage] = useState('1')
@@ -2401,17 +2910,43 @@ function HistorySyncPage({
 
   const filteredRows = useMemo(() => {
     const keyword = query.trim().toLowerCase()
+    const parsedMinKLineCount = minKLineCount === '' ? null : Math.max(0, Number(minKLineCount))
+    const parsedMaxKLineCount = maxKLineCount === '' ? null : Math.max(0, Number(maxKLineCount))
     return rows.filter(row => {
       const statusOk = statusFilter === 'all' || row.status === statusFilter
       const securityTypeOk = securityTypeFilter === 'all' || row.securityType === securityTypeFilter
       const keywordOk = !keyword || [row.code, row.name].some(value => String(value || '').toLowerCase().includes(keyword))
-      return statusOk && securityTypeOk && keywordOk
+      const kLineCount = Number(row.rowCount) || 0
+      const minKLineCountOk = !Number.isFinite(parsedMinKLineCount) || kLineCount >= parsedMinKLineCount
+      const maxKLineCountOk = !Number.isFinite(parsedMaxKLineCount) || kLineCount <= parsedMaxKLineCount
+      return statusOk && securityTypeOk && keywordOk && minKLineCountOk && maxKLineCountOk
     })
-  }, [rows, query, statusFilter, securityTypeFilter])
+  }, [rows, query, statusFilter, securityTypeFilter, minKLineCount, maxKLineCount])
+  const sortedRows = useMemo(() => {
+    const direction = sortDirection === 'asc' ? 1 : -1
+    return filteredRows
+      .map((row, index) => ({ row, index }))
+      .sort((left, right) => {
+        const compared = compareHistoryTableRows(left.row, right.row, sortKey) * direction
+        return compared || left.index - right.index
+      })
+      .map(item => item.row)
+  }, [filteredRows, sortKey, sortDirection])
   const pageRows = useMemo(() => {
     const start = page * rowsPerPage
-    return filteredRows.slice(start, start + rowsPerPage)
-  }, [filteredRows, page, rowsPerPage])
+    return sortedRows.slice(start, start + rowsPerPage)
+  }, [sortedRows, page, rowsPerPage])
+  const selectablePageRows = useMemo(
+    () => pageRows.filter(row => row.securityType === 'a_stock'),
+    [pageRows]
+  )
+  const selectedCount = selectedCodes.size
+  const selectedOnPageCount = selectablePageRows.reduce(
+    (count, row) => count + (selectedCodes.has(row.code) ? 1 : 0),
+    0
+  )
+  const isPageSelected = selectablePageRows.length > 0 && selectedOnPageCount === selectablePageRows.length
+  const isPagePartiallySelected = selectedOnPageCount > 0 && !isPageSelected
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / rowsPerPage))
   useEffect(() => {
     const maxPage = Math.max(0, Math.ceil(filteredRows.length / rowsPerPage) - 1)
@@ -2420,6 +2955,18 @@ function HistorySyncPage({
   useEffect(() => {
     setJumpPage(String(page + 1))
   }, [page])
+  useEffect(() => {
+    const selectableCodes = new Set(rows.filter(row => row.securityType === 'a_stock').map(row => row.code))
+    setSelectedCodes(current => {
+      const next = new Set(Array.from(current).filter(code => selectableCodes.has(code)))
+      return next.size === current.size ? current : next
+    })
+  }, [rows])
+  useEffect(() => {
+    const selectedTaskFinished = state.selectedOnly && ['completed', 'failed', 'stopped'].includes(state.status)
+    if (!selectedTaskFinished) return
+    setSelectedCodes(current => (current.size ? new Set() : current))
+  }, [state.selectedOnly, state.status, state.finishedAt])
 
   useEffect(() => {
     if (!action) return undefined
@@ -2443,9 +2990,20 @@ function HistorySyncPage({
     setPage(0)
     setJumpPage('1')
   }
+  const handleKLineCountFilterChange = (setter, value) => {
+    setter(value)
+    setPage(0)
+    setJumpPage('1')
+  }
   const handlePageChange = (event, nextPage) => setPage(nextPage)
   const handleRowsPerPageChange = event => {
     setRowsPerPage(Number(event.target.value))
+    setPage(0)
+    setJumpPage('1')
+  }
+  const handleSort = nextSortKey => {
+    setSortDirection(current => (sortKey === nextSortKey && current === 'asc' ? 'desc' : 'asc'))
+    setSortKey(nextSortKey)
     setPage(0)
     setJumpPage('1')
   }
@@ -2453,6 +3011,25 @@ function HistorySyncPage({
     const nextPage = Math.min(totalPages, Math.max(1, Number.parseInt(jumpPage, 10) || 1))
     setPage(nextPage - 1)
     setJumpPage(String(nextPage))
+  }
+  const handleSelectCurrentPage = event => {
+    const shouldSelect = event.target.checked
+    setSelectedCodes(current => {
+      const next = new Set(current)
+      selectablePageRows.forEach(row => {
+        if (shouldSelect) next.add(row.code)
+        else next.delete(row.code)
+      })
+      return next
+    })
+  }
+  const handleSelectRow = (code, checked) => {
+    setSelectedCodes(current => {
+      const next = new Set(current)
+      if (checked) next.add(code)
+      else next.delete(code)
+      return next
+    })
   }
 
   return (
@@ -2485,10 +3062,19 @@ function HistorySyncPage({
             <Button startIcon={<PlayArrowIcon />} variant='contained' onClick={() => onStart()} disabled={isBusy || isActive}>
               开始获取
             </Button>
+            <Button
+              startIcon={<PlayArrowIcon />}
+              variant='contained'
+              color='secondary'
+              onClick={() => onStartSelected(Array.from(selectedCodes))}
+              disabled={isBusy || isActive || selectedCount === 0}
+            >
+              获取选中历史数据{selectedCount ? `（${selectedCount}）` : ''}
+            </Button>
             <Button startIcon={<RestartAltIcon />} color='warning' variant='outlined' onClick={onStop} disabled={!isActive}>
               停止
             </Button>
-            <IconButton onClick={onRefresh} disabled={isBusy}>
+            <IconButton onClick={onRefresh} disabled={isBusy || isActive}>
               <SyncIcon className={isActive ? 'spin-icon' : ''} />
             </IconButton>
           </Stack>
@@ -2612,6 +3198,7 @@ function HistorySyncPage({
           <Box className='panel-head'>
             <Typography variant='subtitle2' fontWeight={800}>获取历史数据的列表</Typography>
             <Chip size='small' label={`${filteredRows.length}/${rows.length} 只`} variant='outlined' />
+            <Chip size='small' label={`已选择 ${selectedCount} 只 A 股`} color={selectedCount ? 'secondary' : 'default'} variant='outlined' />
           </Box>
           <Stack direction='row' spacing={1} alignItems='center' flexWrap='wrap' useFlexGap className='history-list-filters'>
             <TextField
@@ -2648,24 +3235,105 @@ function HistorySyncPage({
                 <MenuItem value='not_applicable'>不获取</MenuItem>
               </Select>
             </FormControl>
+            <TextField
+              size='small'
+              type='number'
+              label='K线条数下限'
+              value={minKLineCount}
+              onChange={event => handleKLineCountFilterChange(setMinKLineCount, event.target.value)}
+              inputProps={{ min: 0, step: 1 }}
+              className='history-kline-count-filter'
+            />
+            <TextField
+              size='small'
+              type='number'
+              label='K线条数上限'
+              value={maxKLineCount}
+              onChange={event => handleKLineCountFilterChange(setMaxKLineCount, event.target.value)}
+              inputProps={{ min: 0, step: 1 }}
+              className='history-kline-count-filter'
+            />
+            <Tooltip title='重新读取 SQLite 数据库并刷新列表显示'>
+              <span>
+                <Button
+                  variant='outlined'
+                  startIcon={<SyncIcon className={isBusy ? 'spin-icon' : ''} />}
+                  onClick={onRefresh}
+                  disabled={isBusy || isActive}
+                >
+                  {isBusy ? '刷新中' : '刷新'}
+                </Button>
+              </span>
+            </Tooltip>
           </Stack>
         </Box>
         <TableContainer className='table-wrap full-history-table'>
           <Table size='small' stickyHeader>
             <TableHead>
               <TableRow>
-                <TableCell>股票代码</TableCell>
-                <TableCell>股票名称</TableCell>
-                <TableCell>证券类型</TableCell>
-                <TableCell>获取状态</TableCell>
-                <TableCell align='right'>K线条数</TableCell>
-                <TableCell>更新时间</TableCell>
-                <TableCell>备注</TableCell>
+                <TableCell padding='checkbox'>
+                  <Tooltip title='全选或取消选择当前页 A 股'>
+                    <span>
+                      <Checkbox
+                        size='small'
+                        checked={isPageSelected}
+                        indeterminate={isPagePartiallySelected}
+                        onChange={handleSelectCurrentPage}
+                        disabled={isActive || selectablePageRows.length === 0}
+                        inputProps={{ 'aria-label': '全选或取消选择当前页 A 股' }}
+                      />
+                    </span>
+                  </Tooltip>
+                </TableCell>
+                <TableCell sortDirection={sortKey === 'code' ? sortDirection : false}>
+                  <TableSortLabel active={sortKey === 'code'} direction={sortKey === 'code' ? sortDirection : 'asc'} onClick={() => handleSort('code')}>
+                    股票代码
+                  </TableSortLabel>
+                </TableCell>
+                <TableCell sortDirection={sortKey === 'name' ? sortDirection : false}>
+                  <TableSortLabel active={sortKey === 'name'} direction={sortKey === 'name' ? sortDirection : 'asc'} onClick={() => handleSort('name')}>
+                    股票名称
+                  </TableSortLabel>
+                </TableCell>
+                <TableCell sortDirection={sortKey === 'securityType' ? sortDirection : false}>
+                  <TableSortLabel active={sortKey === 'securityType'} direction={sortKey === 'securityType' ? sortDirection : 'asc'} onClick={() => handleSort('securityType')}>
+                    证券类型
+                  </TableSortLabel>
+                </TableCell>
+                <TableCell sortDirection={sortKey === 'status' ? sortDirection : false}>
+                  <TableSortLabel active={sortKey === 'status'} direction={sortKey === 'status' ? sortDirection : 'asc'} onClick={() => handleSort('status')}>
+                    获取状态
+                  </TableSortLabel>
+                </TableCell>
+                <TableCell align='right' sortDirection={sortKey === 'rowCount' ? sortDirection : false}>
+                  <TableSortLabel active={sortKey === 'rowCount'} direction={sortKey === 'rowCount' ? sortDirection : 'asc'} onClick={() => handleSort('rowCount')}>
+                    K线条数
+                  </TableSortLabel>
+                </TableCell>
+                <TableCell sortDirection={sortKey === 'updatedAt' ? sortDirection : false}>
+                  <TableSortLabel active={sortKey === 'updatedAt'} direction={sortKey === 'updatedAt' ? sortDirection : 'asc'} onClick={() => handleSort('updatedAt')}>
+                    更新时间
+                  </TableSortLabel>
+                </TableCell>
+                <TableCell sortDirection={sortKey === 'message' ? sortDirection : false}>
+                  <TableSortLabel active={sortKey === 'message'} direction={sortKey === 'message' ? sortDirection : 'asc'} onClick={() => handleSort('message')}>
+                    备注
+                  </TableSortLabel>
+                </TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
               {pageRows.map(row => (
-                <TableRow key={row.code} hover selected={row.status === 'running'}>
+                <TableRow key={row.code} hover selected={selectedCodes.has(row.code) || row.status === 'running'}>
+                  <TableCell padding='checkbox'>
+                    <Checkbox
+                      size='small'
+                      checked={selectedCodes.has(row.code)}
+                      onChange={event => handleSelectRow(row.code, event.target.checked)}
+                      disabled={isActive || row.securityType !== 'a_stock'}
+                      inputProps={{ 'aria-label': `选择 ${row.name || row.code}` }}
+                    />
+                  </TableCell>
                   <TableCell><code>{row.code}</code></TableCell>
                   <TableCell>{row.name || row.code}</TableCell>
                   <TableCell>{historySecurityTypeLabel(row.securityType)}</TableCell>
@@ -2681,7 +3349,7 @@ function HistorySyncPage({
               ))}
               {!pageRows.length && (
                 <TableRow>
-                  <TableCell colSpan={7}>
+                  <TableCell colSpan={8}>
                     <Typography variant='body2' color='text.secondary' textAlign='center' py={3}>
                       {rows.length ? '没有符合条件的股票' : '暂无股票列表'}
                     </Typography>
@@ -2774,68 +3442,197 @@ function HistoryItemStatusChip({ status }) {
   return <Chip size='small' label={meta.label} color={meta.color} variant='outlined' />
 }
 
-function BacktestPage({ backtest, benchmarks, strategy }) {
-  const canShowReturns = backtest.available
+function top50RunStatusMeta(status, availableDays = 0, horizonDays = 5) {
+  if (status === 'completed') return { label: '五日已完成', color: 'success' }
+  if (status === 'partial') return { label: `阶段结果 ${availableDays}/${horizonDays} 日`, color: 'primary' }
+  return { label: '等待未来行情', color: 'warning' }
+}
+
+function top50ItemStatusMeta(status) {
+  return {
+    pending: { label: '等待计算', color: 'default' },
+    partial: { label: '阶段结果', color: 'primary' },
+    partial_estimated: { label: '阶段停牌估值', color: 'info' },
+    completed: { label: '已完成', color: 'success' },
+    completed_estimated: { label: '停牌估值', color: 'info' },
+    entry_missing: { label: 'T+1 无开盘价', color: 'warning' },
+    exit_missing: { label: '无有效收盘价', color: 'warning' },
+    insufficient_capital: { label: '资金不足一手', color: 'default' }
+  }[status] || { label: status || '未知', color: 'default' }
+}
+
+function Top50ItemStatusChip({ status }) {
+  const meta = top50ItemStatusMeta(status)
+  return <Chip size='small' label={meta.label} color={meta.color} variant='outlined' />
+}
+
+function BacktestPage({ performance, onRefresh, onSelectRun }) {
+  const { loading, records, selectedId, detail, error } = performance
+  const record = detail?.record || records.find(item => String(item.id) === String(selectedId)) || null
+  const items = Array.isArray(detail?.items) ? detail.items : []
+  const availableDays = Math.min(Number(record?.availableDays) || 0, Number(record?.horizonDays) || 5)
+  const horizonDays = Number(record?.horizonDays) || 5
+  const statusMeta = top50RunStatusMeta(record?.status, availableDays, horizonDays)
+  const hasCompleted = record?.status === 'completed'
+  const hasResults = hasCompleted || record?.status === 'partial'
+
   return (
     <Box className='page'>
-      <PageTitle icon={<AssessmentIcon color='primary' />} title='回测分析页' />
-      {!canShowReturns && (
-        <Alert severity='info' sx={{ mb: 2 }}>
-          当前行情快照不包含未来收益样本，收益回测暂不计算；下方保留当前候选数量和文档基准结果。
+      <PageTitle
+        icon={<AssessmentIcon color='primary' />}
+        title='Top50 五日跟踪'
+        action={(
+          <Button startIcon={<SyncIcon />} variant='outlined' disabled={loading} onClick={onRefresh}>
+            刷新未来行情
+          </Button>
+        )}
+      />
+      {loading && <LinearProgress sx={{ mb: 2 }} />}
+      {error && <Alert severity='error' sx={{ mb: 2 }}>{error}</Alert>}
+
+      <Paper className='panel' variant='outlined' sx={{ mb: 2 }}>
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ md: 'center' }} justifyContent='space-between'>
+          <FormControl size='small' sx={{ minWidth: { xs: '100%', md: 360 } }}>
+            <InputLabel id='top50-performance-label'>每日计算批次</InputLabel>
+            <Select
+              labelId='top50-performance-label'
+              value={selectedId || ''}
+              label='每日计算批次'
+              disabled={loading || records.length === 0}
+              onChange={event => onSelectRun(event.target.value)}
+            >
+              {records.map(item => {
+                const meta = top50RunStatusMeta(item.status, item.availableDays, item.horizonDays)
+                return (
+                  <MenuItem key={item.id} value={String(item.id)}>
+                    {item.signalDate || '--'} · {formatDateTime(item.calculatedAt)} · {meta.label}
+                  </MenuItem>
+                )
+              })}
+            </Select>
+          </FormControl>
+          {record && (
+            <Stack direction='row' spacing={1} flexWrap='wrap' useFlexGap>
+              <Chip size='small' label={`策略 ${record.strategyVersion || '--'}`} variant='outlined' />
+              <Chip size='small' label={`Top ${record.stockCount || 0}`} variant='outlined' />
+              <Chip size='small' label={statusMeta.label} color={statusMeta.color} />
+            </Stack>
+          )}
+        </Stack>
+        <Alert severity='info' sx={{ mt: 2 }}>
+          统计口径：T 日计算排名前 50，T+1 开盘买入；有几个未来完整市场交易日就先计算到当前最后一日，满 5 日后形成最终结果。每股默认分配 1 万元、按 100 股整手交易，并扣除 {formatPercent(Number(record?.costRate) || 0.15)} 综合成本。停牌时使用当前估值日及之前最近一个有效收盘价。
+        </Alert>
+      </Paper>
+
+      {!record && !loading && !error && (
+        <Alert severity='info'>暂无 Top50 跟踪批次。请先在策略配置页执行一次全市场计算。</Alert>
+      )}
+
+      {record && !hasResults && (
+        <Alert severity='warning' sx={{ mb: 2 }}>
+          信号日 {record.signalDate} 之后尚无完整市场交易日。点击“刷新未来行情”会重新检查 SQLite，发现未来行情后立即计算。
         </Alert>
       )}
-      <Box className='metric-grid'>
-        <MetricCard label={canShowReturns ? '样例信号' : '当前候选'} value={backtest.signals} sub={`可统计 ${backtest.tradable}`} accent='blue' />
-        <MetricCard label='T+5 胜率' value={canShowReturns ? `${backtest.win5}%` : '--'} sub={canShowReturns ? `均值 ${formatPercent(backtest.avg5)}` : '等待历史样本'} accent='green' />
-        <MetricCard label='T+10 胜率' value={canShowReturns ? `${backtest.win10}%` : '--'} sub={canShowReturns ? `均值 ${formatPercent(backtest.avg10)}` : '等待历史样本'} accent='cyan' />
-        <MetricCard label='交易约束' value={`${backtest.filtered}`} sub={`成本 ${formatPercent(strategy.costRate)}`} accent='amber' />
-      </Box>
 
-      <Box className='content-grid two-columns'>
-        <Paper className='panel' variant='outlined'>
-          <Typography variant='subtitle2' fontWeight={800}>样例收益分布</Typography>
-          <Box className='distribution'>
-            {canShowReturns
-              ? backtest.returns.map((value, index) => (
-                <Tooltip title={formatPercent(value)} key={`${value}-${index}`}>
-                  <span className={value >= 0 ? 'return-bar positive' : 'return-bar negative'} style={{ height: `${Math.max(10, Math.abs(value) * 14)}px` }} />
-                </Tooltip>
-              ))
-              : <Typography variant='body2' color='text.secondary'>暂无可计算收益分布</Typography>}
+      {record && hasResults && !hasCompleted && (
+        <Alert severity='info' sx={{ mb: 2 }}>
+          当前已找到 {availableDays}/{horizonDays} 个未来完整市场交易日，现有指标按 {record.entryDate || '--'} 开盘买入、{record.exitDate || '--'} 收盘估值计算；后续点击刷新会自动更新到最新交易日。
+        </Alert>
+      )}
+
+      {record && (
+        <>
+          <Box className='metric-grid'>
+            <MetricCard
+              label={`未来 ${availableDays || '--'} 日胜率`}
+              value={hasResults ? formatPercent(record.winRate || 0) : '--'}
+              sub={hasResults ? `盈利 ${record.winCount || 0} / 可交易 ${record.tradableCount || 0}` : `未来行情 0/${horizonDays}`}
+              accent='green'
+            />
+            <MetricCard
+              label='累计净涨跌幅'
+              value={hasResults ? signed(record.sumReturnPct || 0, value => formatPercent(value)) : '--'}
+              sub={hasResults
+                ? `平均 ${signed(record.avgReturnPct || 0, value => formatPercent(value))} · 每股涨跌额合计 ¥${signed(record.sumPriceChange || 0)}`
+                : '等待首个未来交易日'}
+              accent='blue'
+            />
+            <MetricCard
+              label='涨跌总金额'
+              value={hasResults ? `¥${signed(record.totalProfit || 0)}` : '--'}
+              sub={hasResults ? `实际投入 ¥${formatCny(record.totalInvestment || 0)}` : '按每股 1 万元预算'}
+              accent='cyan'
+            />
+            <MetricCard
+              label='组合收益率'
+              value={hasResults ? signed(record.portfolioReturnPct || 0, value => formatPercent(value)) : '--'}
+              sub={hasResults ? `亏损 ${record.lossCount || 0} · 持平 ${record.flatCount || 0}` : `信号日 ${record.signalDate}`}
+              accent='amber'
+            />
           </Box>
-          <Typography variant='caption' color='text.secondary'>
-            T 日收盘出信号，T+1 开盘买入，扣除 {formatPercent(strategy.costRate)} 综合成本。
-          </Typography>
-        </Paper>
 
-        <Paper className='panel' variant='outlined'>
-          <Typography variant='subtitle2' fontWeight={800}>文档基准结果</Typography>
-          <TableContainer sx={{ mt: 1 }}>
-            <Table size='small'>
-              <TableHead>
-                <TableRow>
-                  <TableCell>策略</TableCell>
-                  <TableCell>信号</TableCell>
-                  <TableCell>5日胜率</TableCell>
-                  <TableCell>5日均值</TableCell>
-                  <TableCell>10日胜率</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {benchmarks.map(row => (
-                  <TableRow key={row.strategy}>
-                    <TableCell>{row.strategy}</TableCell>
-                    <TableCell>{row.signals}</TableCell>
-                    <TableCell>{formatPercent(row.tradeWin5)}</TableCell>
-                    <TableCell><TrendChip value={row.tradeAvg5} /></TableCell>
-                    <TableCell>{formatPercent(row.tradeWin10)}</TableCell>
+          <Paper className='panel' variant='outlined'>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} justifyContent='space-between' sx={{ mb: 1 }}>
+              <Typography variant='subtitle2' fontWeight={800}>当日计算排名前 50 明细</Typography>
+              <Typography variant='caption' color='text.secondary'>买入日 {record.entryDate || '--'} · {hasCompleted ? '最终卖出日' : '当前估值日'} {record.exitDate || '--'}</Typography>
+            </Stack>
+            <TableContainer sx={{ maxHeight: 620 }}>
+              <Table size='small' stickyHeader>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>排名</TableCell>
+                    <TableCell>股票</TableCell>
+                    <TableCell align='right'>评分</TableCell>
+                    <TableCell align='right'>信号收盘</TableCell>
+                    <TableCell align='right'>T+1 开盘</TableCell>
+                    <TableCell align='right'>卖出收盘</TableCell>
+                    <TableCell align='right'>每股涨跌</TableCell>
+                    <TableCell align='right'>净涨跌幅</TableCell>
+                    <TableCell align='right'>股数</TableCell>
+                    <TableCell align='right'>盈亏金额</TableCell>
+                    <TableCell>状态</TableCell>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </TableContainer>
-        </Paper>
-      </Box>
+                </TableHead>
+                <TableBody>
+                  {items.map(item => (
+                    <TableRow key={item.stockCode} hover>
+                      <TableCell>{item.rank}</TableCell>
+                      <TableCell>
+                        <Typography variant='body2' fontWeight={700}>{item.stockName || item.stockCode}</Typography>
+                        <Typography variant='caption' color='text.secondary'>{item.stockCode}</Typography>
+                      </TableCell>
+                      <TableCell align='right'>{Number(item.totalScore || 0).toFixed(2)}</TableCell>
+                      <TableCell align='right'>{formatCny(item.signalClose)}</TableCell>
+                      <TableCell align='right'>
+                        <Typography variant='body2'>{Number.isFinite(item.entryOpen) ? formatCny(item.entryOpen) : '--'}</Typography>
+                        <Typography variant='caption' color='text.secondary'>{item.entryDate || '--'}</Typography>
+                      </TableCell>
+                      <TableCell align='right'>
+                        <Typography variant='body2'>{Number.isFinite(item.exitClose) ? formatCny(item.exitClose) : '--'}</Typography>
+                        <Typography variant='caption' color='text.secondary'>{item.exitPriceDate || item.exitDate || '--'}</Typography>
+                      </TableCell>
+                      <TableCell align='right' className={profitClass(item.priceChange)}>{signed(item.priceChange)}</TableCell>
+                      <TableCell align='right'>
+                        {Number.isFinite(item.netReturnPct) ? <TrendChip value={item.netReturnPct} /> : '--'}
+                      </TableCell>
+                      <TableCell align='right'>{item.shares ? item.shares.toLocaleString('zh-CN') : '--'}</TableCell>
+                      <TableCell align='right' className={profitClass(item.profitAmount)}>
+                        {Number.isFinite(item.profitAmount) ? `¥${signed(item.profitAmount)}` : '--'}
+                      </TableCell>
+                      <TableCell><Top50ItemStatusChip status={item.resultStatus} /></TableCell>
+                    </TableRow>
+                  ))}
+                  {!items.length && (
+                    <TableRow>
+                      <TableCell colSpan={11} align='center'>暂无明细</TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </Paper>
+        </>
+      )}
     </Box>
   )
 }

@@ -106,6 +106,8 @@ const FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME = 'fetch_all_a_stocks_v3.exe'
 const FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME)
 const FULL_HISTORY_EXECUTABLE_NAME = 'fetch_a_stock_history_by_stock.exe'
 const FULL_HISTORY_EXECUTABLE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_EXECUTABLE_NAME)
+const FULL_HISTORY_SELECTED_CODES_NAME = 'selected-history-codes.json'
+const FULL_HISTORY_SELECTED_CODES_FILE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_SELECTED_CODES_NAME)
 const FULL_HISTORY_CALCULATE_STOCK_LIST_NAME = 'all-market-stocks-Calculate.json'
 const FULL_HISTORY_CALCULATE_STOCK_LIST_FILE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_CALCULATE_STOCK_LIST_NAME)
 const FULL_HISTORY_OUTPUT_DIR_NAME = 'all-market-history-by-stock'
@@ -1717,9 +1719,18 @@ async function fetchPortfolioSpot(options = {}) {
   }
 }
 
+// Windows 对 CreateProcess 命令行长度有严格上限。业务脚本可能达到数十 KB，
+// 因此这里只把一个很小的启动器放在 -c 参数中，真实脚本和输入统一走 stdin。
+const PYTHON_STDIN_RUNNER = [
+  'import io, json, sys',
+  'envelope = json.load(sys.stdin)',
+  'sys.stdin = io.StringIO(json.dumps(envelope.get("input") or {}, ensure_ascii=False))',
+  'exec(compile(envelope.get("script") or "", "<stock-review-python>", "exec"), {"__name__": "__main__"})'
+].join('\n')
+
 function runPythonJson({ pythonPath, script, input, timeout = 120000, label = 'Python' }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(pythonPath || 'python', ['-c', script], {
+    const child = spawn(pythonPath || 'python', ['-c', PYTHON_STDIN_RUNNER], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       env: {
@@ -1754,8 +1765,10 @@ function runPythonJson({ pythonPath, script, input, timeout = 120000, label = 'P
         reject(new Error(`${label} 返回非JSON内容：${outText.slice(0, 240)} ${errText.slice(0, 240)}`))
       }
     })
-    child.stdin.write(Buffer.from(JSON.stringify(input || {}), 'utf8'))
-    child.stdin.end()
+    child.stdin.end(Buffer.from(JSON.stringify({
+      script: String(script || ''),
+      input: input || {}
+    }), 'utf8'))
   })
 }
 
@@ -2650,14 +2663,18 @@ function resolveFullHistoryStockIndexFile() {
   return FULL_HISTORY_STOCK_INDEX_FILE
 }
 
-function buildFullHistoryArgs(startDate, endDate) {
-  return [
+function buildFullHistoryArgs(startDate, endDate, options = {}) {
+  const args = [
     '--start', normalizeFullHistoryDate(startDate),
     '--end', normalizeFullHistoryDate(endDate),
     '--database', STOCK_REVIEW_DATABASE_NAME,
-    '--source', 'baostock',
-    '--resume'
+    '--source', 'baostock'
   ]
+  if (options.selectedOnly && options.selectedCodesFile) {
+    args.push('--codes-file', options.selectedCodesFile, '--force-refetch')
+  }
+  args.push('--resume')
+  return args
 }
 
 function quoteCommandArgument(value) {
@@ -2665,10 +2682,13 @@ function quoteCommandArgument(value) {
   return /\s/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text
 }
 
-function buildFullHistoryCommand(startDate, endDate) {
+function buildFullHistoryCommand(startDate, endDate, options = {}) {
   const start = normalizeFullHistoryDate(startDate) || '<开始日期>'
   const end = normalizeFullHistoryDate(endDate) || '<结束日期>'
-  return `${FULL_HISTORY_EXECUTABLE_NAME} --start ${quoteCommandArgument(start)} --end ${quoteCommandArgument(end)} --database "${STOCK_REVIEW_DATABASE_NAME}" --source baostock --resume`
+  const selectedArgs = options.selectedOnly && options.selectedCodesFile
+    ? ` --codes-file ${quoteCommandArgument(options.selectedCodesFile)} --force-refetch`
+    : ''
+  return `${FULL_HISTORY_EXECUTABLE_NAME} --start ${quoteCommandArgument(start)} --end ${quoteCommandArgument(end)} --database "${STOCK_REVIEW_DATABASE_NAME}" --source baostock${selectedArgs} --resume`
 }
 
 // 创建全市场历史同步任务对象，前端轮询看到的状态都从这里派生。
@@ -2732,6 +2752,7 @@ function createFullHistoryJob(base = {}, items = []) {
     dailyFiles: Array.isArray(base.dailyFiles) ? base.dailyFiles : [],
     selectedOnly: Boolean(base.selectedOnly),
     selectedCodes: Array.isArray(base.selectedCodes) ? base.selectedCodes.map(normalizeCacheCode).filter(Boolean) : [],
+    selectedCodesFile: String(base.selectedCodesFile || ''),
     retryTaskMap,
     dates: rawDates.map(item => (typeof item === 'string' ? { date: item } : item)).map(item => ({
       date: normalizeFullHistoryDate(item.date || item.time || ''),
@@ -2843,6 +2864,7 @@ function buildFullHistorySnapshot(job = fullHistoryJob) {
     dailyFiles: Array.isArray(job?.dailyFiles) ? job.dailyFiles : [],
     selectedOnly: Boolean(job?.selectedOnly),
     selectedCodes: Array.isArray(job?.selectedCodes) ? job.selectedCodes : [],
+    selectedCodesFile: String(job?.selectedCodesFile || ''),
     retryTaskMap: job?.retryTaskMap || null,
     dates: dates.map(item => ({
       date: item.date,
@@ -3442,6 +3464,535 @@ def one(sql, parameters=()):
     row = connection.execute(sql, parameters).fetchone()
     return dict(row) if row is not None else None
 
+def json_value(value, fallback):
+    if value in (None, ""):
+        return fallback
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+def json_text(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+def ensure_calculation_schema():
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS calculation_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            calculated_at TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            strategy_version TEXT NOT NULL DEFAULT '',
+            strategy_json TEXT NOT NULL,
+            market_json TEXT NOT NULL,
+            bundle_meta_json TEXT NOT NULL,
+            stock_count INTEGER NOT NULL DEFAULT 0 CHECK (stock_count >= 0),
+            sector_count INTEGER NOT NULL DEFAULT 0 CHECK (sector_count >= 0),
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_calculation_runs_latest
+        ON calculation_runs(calculated_at DESC, id DESC);
+
+        CREATE TABLE IF NOT EXISTS calculation_stocks (
+            calculation_id INTEGER NOT NULL,
+            stock_code TEXT NOT NULL,
+            rank INTEGER NOT NULL DEFAULT 0,
+            total_score REAL NOT NULL DEFAULT 0,
+            risk_penalty REAL NOT NULL DEFAULT 0,
+            is_selected INTEGER NOT NULL DEFAULT 0 CHECK (is_selected IN (0, 1)),
+            result_json TEXT NOT NULL,
+            PRIMARY KEY (calculation_id, stock_code),
+            FOREIGN KEY (calculation_id) REFERENCES calculation_runs(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_calculation_stocks_rank
+        ON calculation_stocks(calculation_id, rank, stock_code);
+
+        CREATE INDEX IF NOT EXISTS idx_calculation_stocks_score
+        ON calculation_stocks(calculation_id, total_score DESC);
+
+        CREATE TABLE IF NOT EXISTS calculation_sectors (
+            calculation_id INTEGER NOT NULL,
+            sector_key TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            score REAL NOT NULL DEFAULT 0,
+            result_json TEXT NOT NULL,
+            PRIMARY KEY (calculation_id, sector_key),
+            FOREIGN KEY (calculation_id) REFERENCES calculation_runs(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_calculation_sectors_order
+        ON calculation_sectors(calculation_id, sort_order, sector_key);
+
+        CREATE TABLE IF NOT EXISTS top50_tracking_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_calculation_id INTEGER NOT NULL UNIQUE,
+            history_dataset_id INTEGER,
+            calculated_at TEXT NOT NULL,
+            signal_date TEXT NOT NULL,
+            strategy_version TEXT NOT NULL DEFAULT '',
+            horizon_days INTEGER NOT NULL DEFAULT 5 CHECK (horizon_days > 0),
+            capital_per_stock REAL NOT NULL DEFAULT 10000 CHECK (capital_per_stock > 0),
+            cost_rate REAL NOT NULL DEFAULT 0 CHECK (cost_rate >= 0),
+            entry_date TEXT,
+            exit_date TEXT,
+            available_days INTEGER NOT NULL DEFAULT 0 CHECK (available_days >= 0),
+            status TEXT NOT NULL DEFAULT 'pending',
+            stock_count INTEGER NOT NULL DEFAULT 0 CHECK (stock_count >= 0),
+            tradable_count INTEGER NOT NULL DEFAULT 0 CHECK (tradable_count >= 0),
+            win_count INTEGER NOT NULL DEFAULT 0 CHECK (win_count >= 0),
+            loss_count INTEGER NOT NULL DEFAULT 0 CHECK (loss_count >= 0),
+            flat_count INTEGER NOT NULL DEFAULT 0 CHECK (flat_count >= 0),
+            win_rate REAL,
+            sum_price_change REAL,
+            sum_return_pct REAL,
+            avg_return_pct REAL,
+            total_investment REAL,
+            total_profit REAL,
+            portfolio_return_pct REAL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_top50_tracking_runs_latest
+        ON top50_tracking_runs(signal_date DESC, calculated_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_top50_tracking_runs_status
+        ON top50_tracking_runs(status, signal_date);
+
+        CREATE TABLE IF NOT EXISTS top50_tracking_items (
+            tracking_id INTEGER NOT NULL,
+            stock_code TEXT NOT NULL,
+            stock_name TEXT NOT NULL DEFAULT '',
+            rank INTEGER NOT NULL,
+            total_score REAL NOT NULL DEFAULT 0,
+            signal_date TEXT NOT NULL,
+            signal_close REAL NOT NULL DEFAULT 0,
+            entry_date TEXT,
+            entry_open REAL,
+            exit_date TEXT,
+            exit_price_date TEXT,
+            exit_close REAL,
+            shares INTEGER NOT NULL DEFAULT 0 CHECK (shares >= 0),
+            gross_return_pct REAL,
+            net_return_pct REAL,
+            price_change REAL,
+            investment_amount REAL,
+            profit_amount REAL,
+            result_status TEXT NOT NULL DEFAULT 'pending',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tracking_id, stock_code),
+            FOREIGN KEY (tracking_id) REFERENCES top50_tracking_runs(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_top50_tracking_items_rank
+        ON top50_tracking_items(tracking_id, rank, stock_code);
+
+        CREATE INDEX IF NOT EXISTS idx_top50_tracking_items_result
+        ON top50_tracking_items(tracking_id, result_status, net_return_pct DESC);
+    """)
+    # 兼容已经运行过早期开发版本的数据库，新增汇总字段时进行轻量原地迁移。
+    tracking_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(top50_tracking_runs)").fetchall()
+    }
+    if "history_dataset_id" not in tracking_columns:
+        connection.execute("ALTER TABLE top50_tracking_runs ADD COLUMN history_dataset_id INTEGER")
+    if "sum_price_change" not in tracking_columns:
+        connection.execute("ALTER TABLE top50_tracking_runs ADD COLUMN sum_price_change REAL")
+
+def calculation_record(row):
+    strategy = json_value(row.get("strategy_json"), {})
+    return {
+        "id": str(row.get("id")),
+        "savedAt": str(row.get("calculated_at") or row.get("created_at") or ""),
+        "calculationRange": {
+            "startDate": str(row.get("start_date") or ""),
+            "endDate": str(row.get("end_date") or "")
+        },
+        "stockCount": int(row.get("stock_count") or 0),
+        "sectorCount": int(row.get("sector_count") or 0),
+        "strategyVersion": str(row.get("strategy_version") or strategy.get("version") or ""),
+        "strategy": strategy
+    }
+
+def list_calculation_records():
+    rows = connection.execute("""
+        SELECT id, calculated_at, start_date, end_date, strategy_version,
+               strategy_json, stock_count, sector_count, created_at
+        FROM calculation_runs
+        ORDER BY calculated_at DESC, id DESC
+        LIMIT 5
+    """).fetchall()
+    return [calculation_record(dict(row)) for row in rows]
+
+def number(value, fallback=0.0):
+    try:
+        parsed = float(value)
+        return parsed if parsed == parsed else fallback
+    except Exception:
+        return fallback
+
+def rounded(value, digits=4):
+    return round(number(value), digits)
+
+def top50_tracking_record(row):
+    return {
+        "id": str(row.get("id")),
+        "sourceCalculationId": str(row.get("source_calculation_id")),
+        "historyDatasetId": None if row.get("history_dataset_id") is None else int(row.get("history_dataset_id")),
+        "calculatedAt": str(row.get("calculated_at") or ""),
+        "signalDate": str(row.get("signal_date") or ""),
+        "strategyVersion": str(row.get("strategy_version") or ""),
+        "horizonDays": int(row.get("horizon_days") or 5),
+        "capitalPerStock": number(row.get("capital_per_stock"), 10000),
+        "costRate": number(row.get("cost_rate"), 0),
+        "entryDate": str(row.get("entry_date") or ""),
+        "exitDate": str(row.get("exit_date") or ""),
+        "availableDays": int(row.get("available_days") or 0),
+        "status": str(row.get("status") or "pending"),
+        "stockCount": int(row.get("stock_count") or 0),
+        "tradableCount": int(row.get("tradable_count") or 0),
+        "winCount": int(row.get("win_count") or 0),
+        "lossCount": int(row.get("loss_count") or 0),
+        "flatCount": int(row.get("flat_count") or 0),
+        "winRate": None if row.get("win_rate") is None else number(row.get("win_rate")),
+        "sumPriceChange": None if row.get("sum_price_change") is None else number(row.get("sum_price_change")),
+        "sumReturnPct": None if row.get("sum_return_pct") is None else number(row.get("sum_return_pct")),
+        "avgReturnPct": None if row.get("avg_return_pct") is None else number(row.get("avg_return_pct")),
+        "totalInvestment": None if row.get("total_investment") is None else number(row.get("total_investment")),
+        "totalProfit": None if row.get("total_profit") is None else number(row.get("total_profit")),
+        "portfolioReturnPct": None if row.get("portfolio_return_pct") is None else number(row.get("portfolio_return_pct")),
+        "updatedAt": str(row.get("updated_at") or "")
+    }
+
+def list_top50_tracking_records():
+    rows = connection.execute("""
+        SELECT * FROM top50_tracking_runs
+        ORDER BY signal_date DESC, calculated_at DESC, id DESC
+        LIMIT 250
+    """).fetchall()
+    return [top50_tracking_record(dict(row)) for row in rows]
+
+def cleanup_top50_tracking_records(limit=250):
+    stale_ids = [int(row["id"]) for row in connection.execute("""
+        SELECT id FROM top50_tracking_runs
+        ORDER BY signal_date DESC, calculated_at DESC, id DESC
+        LIMIT -1 OFFSET ?
+    """, (limit,)).fetchall()]
+    if stale_ids:
+        connection.executemany(
+            "DELETE FROM top50_tracking_runs WHERE id = ?",
+            [(item,) for item in stale_ids]
+        )
+    return stale_ids
+
+def create_top50_tracking_for_calculation(calculation_id):
+    run = one("""
+        SELECT id, calculated_at, end_date, strategy_version, strategy_json, market_json
+        FROM calculation_runs WHERE id = ?
+    """, (calculation_id,))
+    if not run:
+        return None
+
+    strategy = json_value(run.get("strategy_json"), {})
+    market = json_value(run.get("market_json"), {})
+    signal_date = str(market.get("tradeDate") or run.get("end_date") or "")
+    if not signal_date:
+        return None
+    now = utc_now()
+    dataset = one("SELECT id FROM history_datasets WHERE is_active = 1 ORDER BY id DESC LIMIT 1")
+    connection.execute("""
+        INSERT OR IGNORE INTO top50_tracking_runs (
+            source_calculation_id, history_dataset_id, calculated_at, signal_date, strategy_version,
+            horizon_days, capital_per_stock, cost_rate, status,
+            stock_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 5, 10000, ?, 'pending', 0, ?, ?)
+    """, (
+        calculation_id,
+        int(dataset["id"]) if dataset else None,
+        run.get("calculated_at"),
+        signal_date,
+        str(run.get("strategy_version") or strategy.get("version") or ""),
+        number(strategy.get("costRate"), 0.15),
+        now,
+        now
+    ))
+    tracking = one("SELECT id FROM top50_tracking_runs WHERE source_calculation_id = ?", (calculation_id,))
+    if not tracking:
+        return None
+    tracking_id = int(tracking["id"])
+    existing_count = one("SELECT COUNT(*) AS count FROM top50_tracking_items WHERE tracking_id = ?", (tracking_id,)) or {}
+    if int(existing_count.get("count") or 0) == 0:
+        rows = connection.execute("""
+            SELECT stock_code, rank, total_score, result_json
+            FROM calculation_stocks
+            WHERE calculation_id = ?
+            ORDER BY rank, stock_code
+            LIMIT 50
+        """, (calculation_id,)).fetchall()
+        items = []
+        for row in rows:
+            stock = json_value(row["result_json"], {})
+            items.append((
+                tracking_id,
+                str(row["stock_code"]),
+                str(stock.get("name") or row["stock_code"]),
+                int(row["rank"] or 0),
+                number(row["total_score"]),
+                signal_date,
+                number(stock.get("close")),
+                now
+            ))
+        connection.executemany("""
+            INSERT INTO top50_tracking_items (
+                tracking_id, stock_code, stock_name, rank, total_score,
+                signal_date, signal_close, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, items)
+        connection.execute(
+            "UPDATE top50_tracking_runs SET stock_count = ?, updated_at = ? WHERE id = ?",
+            (len(items), now, tracking_id)
+        )
+    return tracking_id
+
+def backfill_top50_tracking():
+    rows = connection.execute("""
+        SELECT r.id
+        FROM calculation_runs r
+        LEFT JOIN top50_tracking_runs t ON t.source_calculation_id = r.id
+        WHERE t.id IS NULL
+        ORDER BY r.calculated_at, r.id
+    """).fetchall()
+    for row in rows:
+        create_top50_tracking_for_calculation(int(row["id"]))
+
+def future_market_dates(dataset_id, signal_date, horizon_days):
+    # 至少有 1000 只股票有数据才视为完整市场交易日，避免单股补数被误计为 T+1。
+    rows = connection.execute("""
+        SELECT b.trade_date
+        FROM daily_bars b
+        WHERE b.dataset_id = ? AND b.trade_date > ?
+        GROUP BY b.trade_date
+        HAVING COUNT(DISTINCT b.stock_code) >= 1000
+        ORDER BY b.trade_date
+        LIMIT ?
+    """, (dataset_id, signal_date, horizon_days)).fetchall()
+    return [str(row["trade_date"]) for row in rows]
+
+def refresh_top50_tracking_run(tracking_id, dataset_id, force=False):
+    run = one("SELECT * FROM top50_tracking_runs WHERE id = ?", (tracking_id,))
+    if not run or (run.get("status") == "completed" and not force):
+        return
+    stored_dataset_id = int(run.get("history_dataset_id") or 0)
+    if stored_dataset_id:
+        stored_dataset = one("SELECT id FROM history_datasets WHERE id = ?", (stored_dataset_id,))
+        if stored_dataset:
+            dataset_id = stored_dataset_id
+    horizon_days = int(run.get("horizon_days") or 5)
+    dates = future_market_dates(dataset_id, str(run.get("signal_date") or ""), horizon_days)
+    available_days = len(dates)
+    entry_date = dates[0] if dates else ""
+    # 有几个未来交易日就先计算到第几个；达到 horizon_days 后结果转为最终状态。
+    exit_date = dates[-1] if dates else ""
+    now = utc_now()
+    if available_days == 0:
+        connection.execute("""
+            UPDATE top50_tracking_runs
+            SET available_days = ?, entry_date = NULLIF(?, ''), exit_date = NULL,
+                status = 'pending', tradable_count = 0, win_count = 0,
+                loss_count = 0, flat_count = 0, win_rate = NULL,
+                sum_price_change = NULL, sum_return_pct = NULL, avg_return_pct = NULL,
+                total_investment = NULL, total_profit = NULL, portfolio_return_pct = NULL,
+                updated_at = ?
+            WHERE id = ?
+        """, (available_days, entry_date, now, tracking_id))
+        connection.execute("""
+            UPDATE top50_tracking_items
+            SET entry_date = NULLIF(?, ''), entry_open = NULL, exit_date = NULL,
+                exit_price_date = NULL, exit_close = NULL, shares = 0,
+                gross_return_pct = NULL, net_return_pct = NULL, price_change = NULL,
+                investment_amount = NULL, profit_amount = NULL,
+                result_status = 'pending', updated_at = ?
+            WHERE tracking_id = ?
+        """, (entry_date, now, tracking_id))
+        return
+
+    capital_per_stock = number(run.get("capital_per_stock"), 10000)
+    cost_rate = number(run.get("cost_rate"), 0.15)
+    items = connection.execute("""
+        SELECT stock_code FROM top50_tracking_items
+        WHERE tracking_id = ? ORDER BY rank, stock_code
+    """, (tracking_id,)).fetchall()
+    results = []
+    for item in items:
+        code = str(item["stock_code"])
+        entry = one("""
+            SELECT open FROM daily_bars
+            WHERE dataset_id = ? AND stock_code = ? AND trade_date = ?
+        """, (dataset_id, code, entry_date))
+        entry_open = number(entry.get("open")) if entry else 0
+        if entry_open <= 0:
+            results.append((
+                entry_date, exit_date, None, None, 0, None, None, None,
+                None, None, 'entry_missing', now, tracking_id, code
+            ))
+            continue
+
+        exit_row = one("""
+            SELECT trade_date, close FROM daily_bars
+            WHERE dataset_id = ? AND stock_code = ?
+              AND trade_date BETWEEN ? AND ? AND close IS NOT NULL AND close > 0
+            ORDER BY trade_date DESC
+            LIMIT 1
+        """, (dataset_id, code, entry_date, exit_date))
+        exit_close = number(exit_row.get("close")) if exit_row else 0
+        if exit_close <= 0:
+            results.append((
+                entry_date, exit_date, None, entry_open, 0, None, None, None,
+                None, None, 'exit_missing', now, tracking_id, code
+            ))
+            continue
+
+        shares = int(capital_per_stock / entry_open / 100) * 100
+        if shares < 100:
+            results.append((
+                entry_date, exit_date, str(exit_row.get("trade_date") or ""), entry_open,
+                0, exit_close, None, exit_close - entry_open, None, None,
+                'insufficient_capital', now, tracking_id, code
+            ))
+            continue
+
+        gross_return_pct = (exit_close / entry_open - 1) * 100
+        net_return_pct = gross_return_pct - cost_rate
+        investment_amount = shares * entry_open
+        profit_amount = shares * (exit_close - entry_open) - investment_amount * cost_rate / 100
+        is_final = available_days >= horizon_days
+        if str(exit_row.get("trade_date")) == exit_date:
+            result_status = 'completed' if is_final else 'partial'
+        else:
+            result_status = 'completed_estimated' if is_final else 'partial_estimated'
+        results.append((
+            entry_date, exit_date, str(exit_row.get("trade_date") or ""), entry_open,
+            shares, exit_close, rounded(gross_return_pct), rounded(exit_close - entry_open),
+            rounded(investment_amount, 2), rounded(profit_amount, 2), result_status,
+            now, tracking_id, code, rounded(net_return_pct)
+        ))
+
+    for values in results:
+        if len(values) == 14:
+            (item_entry_date, item_exit_date, exit_price_date, entry_open, shares,
+             exit_close, gross_return_pct, price_change, investment_amount,
+             profit_amount, result_status, item_updated_at, item_tracking_id, code) = values
+            net_return_pct = None
+        else:
+            (item_entry_date, item_exit_date, exit_price_date, entry_open, shares,
+             exit_close, gross_return_pct, price_change, investment_amount,
+             profit_amount, result_status, item_updated_at, item_tracking_id, code,
+             net_return_pct) = values
+        connection.execute("""
+            UPDATE top50_tracking_items
+            SET entry_date = ?, exit_date = ?, exit_price_date = ?, entry_open = ?,
+                shares = ?, exit_close = ?, gross_return_pct = ?, net_return_pct = ?,
+                price_change = ?, investment_amount = ?, profit_amount = ?,
+                result_status = ?, updated_at = ?
+            WHERE tracking_id = ? AND stock_code = ?
+        """, (
+            item_entry_date, item_exit_date, exit_price_date, entry_open,
+            shares, exit_close, gross_return_pct, net_return_pct,
+            price_change, investment_amount, profit_amount,
+            result_status, item_updated_at, item_tracking_id, code
+        ))
+
+    summary = one("""
+        SELECT
+            COUNT(*) AS tradable_count,
+            SUM(CASE WHEN net_return_pct > 0 THEN 1 ELSE 0 END) AS win_count,
+            SUM(CASE WHEN net_return_pct < 0 THEN 1 ELSE 0 END) AS loss_count,
+            SUM(CASE WHEN net_return_pct = 0 THEN 1 ELSE 0 END) AS flat_count,
+            SUM(price_change) AS sum_price_change,
+            SUM(net_return_pct) AS sum_return_pct,
+            AVG(net_return_pct) AS avg_return_pct,
+            SUM(investment_amount) AS total_investment,
+            SUM(profit_amount) AS total_profit
+        FROM top50_tracking_items
+        WHERE tracking_id = ?
+          AND result_status IN ('partial', 'partial_estimated', 'completed', 'completed_estimated')
+    """, (tracking_id,)) or {}
+    tradable_count = int(summary.get("tradable_count") or 0)
+    win_count = int(summary.get("win_count") or 0)
+    total_investment = number(summary.get("total_investment"))
+    total_profit = number(summary.get("total_profit"))
+    win_rate = (win_count / tradable_count * 100) if tradable_count else 0
+    portfolio_return_pct = (total_profit / total_investment * 100) if total_investment else 0
+    run_status = 'completed' if available_days >= horizon_days else 'partial'
+    connection.execute("""
+        UPDATE top50_tracking_runs
+        SET entry_date = ?, exit_date = ?, available_days = ?, status = ?,
+            tradable_count = ?, win_count = ?, loss_count = ?, flat_count = ?,
+            win_rate = ?, sum_price_change = ?, sum_return_pct = ?, avg_return_pct = ?,
+            total_investment = ?, total_profit = ?, portfolio_return_pct = ?,
+            updated_at = ?
+        WHERE id = ?
+    """, (
+        entry_date, exit_date, available_days, run_status, tradable_count, win_count,
+        int(summary.get("loss_count") or 0), int(summary.get("flat_count") or 0),
+        rounded(win_rate), rounded(summary.get("sum_price_change")), rounded(summary.get("sum_return_pct")),
+        rounded(summary.get("avg_return_pct")), rounded(total_investment, 2),
+        rounded(total_profit, 2), rounded(portfolio_return_pct), now, tracking_id
+    ))
+
+def refresh_top50_tracking(tracking_id=None, force=False):
+    backfill_top50_tracking()
+    dataset = one("SELECT id FROM history_datasets WHERE is_active = 1 ORDER BY id DESC LIMIT 1")
+    if not dataset:
+        return
+    if tracking_id:
+        ids = [int(tracking_id)]
+    else:
+        query = "SELECT id FROM top50_tracking_runs"
+        if not force:
+            query += " WHERE status <> 'completed'"
+        query += " ORDER BY signal_date, calculated_at, id"
+        ids = [int(row["id"]) for row in connection.execute(query).fetchall()]
+    for item in ids:
+        refresh_top50_tracking_run(item, int(dataset["id"]), force)
+
+def top50_tracking_detail(tracking_id):
+    run = one("SELECT * FROM top50_tracking_runs WHERE id = ?", (tracking_id,))
+    if not run:
+        raise ValueError("所选 Top50 跟踪记录不存在")
+    rows = connection.execute("""
+        SELECT * FROM top50_tracking_items
+        WHERE tracking_id = ? ORDER BY rank, stock_code
+    """, (tracking_id,)).fetchall()
+    items = []
+    for raw in rows:
+        row = dict(raw)
+        items.append({
+            "stockCode": str(row.get("stock_code") or ""),
+            "stockName": str(row.get("stock_name") or ""),
+            "rank": int(row.get("rank") or 0),
+            "totalScore": number(row.get("total_score")),
+            "signalDate": str(row.get("signal_date") or ""),
+            "signalClose": number(row.get("signal_close")),
+            "entryDate": str(row.get("entry_date") or ""),
+            "entryOpen": None if row.get("entry_open") is None else number(row.get("entry_open")),
+            "exitDate": str(row.get("exit_date") or ""),
+            "exitPriceDate": str(row.get("exit_price_date") or ""),
+            "exitClose": None if row.get("exit_close") is None else number(row.get("exit_close")),
+            "shares": int(row.get("shares") or 0),
+            "grossReturnPct": None if row.get("gross_return_pct") is None else number(row.get("gross_return_pct")),
+            "netReturnPct": None if row.get("net_return_pct") is None else number(row.get("net_return_pct")),
+            "priceChange": None if row.get("price_change") is None else number(row.get("price_change")),
+            "investmentAmount": None if row.get("investment_amount") is None else number(row.get("investment_amount")),
+            "profitAmount": None if row.get("profit_amount") is None else number(row.get("profit_amount")),
+            "resultStatus": str(row.get("result_status") or "pending"),
+            "updatedAt": str(row.get("updated_at") or "")
+        })
+    return {"record": top50_tracking_record(run), "items": items}
+
 try:
     if not database_file:
         raise ValueError("未提供 SQLite 数据库文件")
@@ -3450,7 +4001,231 @@ try:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 30000")
 
-    if operation == "inspect_coverage":
+    if operation == "list_calculation_results":
+        ensure_calculation_schema()
+        connection.commit()
+        result = {
+            "ok": True,
+            "databaseFile": database_file,
+            "records": list_calculation_records()
+        }
+
+    elif operation == "save_calculation_result":
+        bundle = payload.get("bundle") or {}
+        strategy = payload.get("strategy") or {}
+        market = bundle.get("market") or {}
+        sectors = bundle.get("sectors") if isinstance(bundle.get("sectors"), list) else []
+        stocks = bundle.get("stocks") if isinstance(bundle.get("stocks"), list) else []
+        calculation_range = bundle.get("calculationRange") or {}
+        start_date = str(calculation_range.get("startDate") or payload.get("startDate") or "")
+        end_date = str(calculation_range.get("endDate") or payload.get("endDate") or "")
+        if not start_date or not end_date:
+            raise ValueError("计算结果缺少开始日期或结束日期")
+        if not stocks:
+            raise ValueError("计算结果中没有股票数据")
+
+        calculated_at = str(payload.get("savedAt") or bundle.get("updatedAt") or utc_now())
+        created_at = utc_now()
+        excluded_meta_keys = {"market", "sectors", "stocks", "rawRows"}
+        bundle_meta = {key: value for key, value in bundle.items() if key not in excluded_meta_keys}
+        bundle_meta["rawRows"] = []
+
+        ensure_calculation_schema()
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute("""
+            INSERT INTO calculation_runs (
+                calculated_at, start_date, end_date, strategy_version,
+                strategy_json, market_json, bundle_meta_json,
+                stock_count, sector_count, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            calculated_at,
+            start_date,
+            end_date,
+            str(strategy.get("version") or ""),
+            json_text(strategy),
+            json_text(market),
+            json_text(bundle_meta),
+            len(stocks),
+            len(sectors),
+            created_at
+        ))
+        calculation_id = int(cursor.lastrowid)
+
+        stock_rows = []
+        for index, stock in enumerate(stocks):
+            if not isinstance(stock, dict):
+                continue
+            code = str(stock.get("code") or stock.get("thscode") or stock.get("thsCode") or "").strip().upper()
+            if not code:
+                continue
+            stock_rows.append((
+                calculation_id,
+                code,
+                int(stock.get("rank") or index + 1),
+                float(stock.get("totalScore") or 0),
+                float(stock.get("riskPenalty") or 0),
+                1 if stock.get("selected") else 0,
+                json_text(stock)
+            ))
+        connection.executemany("""
+            INSERT INTO calculation_stocks (
+                calculation_id, stock_code, rank, total_score,
+                risk_penalty, is_selected, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, stock_rows)
+
+        sector_rows = []
+        for index, sector in enumerate(sectors):
+            if not isinstance(sector, dict):
+                continue
+            sector_key = str(sector.get("key") or "sector-%d" % (index + 1))
+            sector_rows.append((
+                calculation_id,
+                sector_key,
+                index + 1,
+                float(sector.get("score") or 0),
+                json_text(sector)
+            ))
+        connection.executemany("""
+            INSERT INTO calculation_sectors (
+                calculation_id, sector_key, sort_order, score, result_json
+            ) VALUES (?, ?, ?, ?, ?)
+        """, sector_rows)
+
+        # Top50 跟踪只保存计算快照和必要字段，生命周期独立于“最近 5 次完整计算结果”。
+        tracking_id = create_top50_tracking_for_calculation(calculation_id)
+        cleanup_top50_tracking_records()
+
+        stale_ids = [row[0] for row in connection.execute("""
+            SELECT id FROM calculation_runs
+            ORDER BY calculated_at DESC, id DESC
+            LIMIT -1 OFFSET 5
+        """).fetchall()]
+        if stale_ids:
+            connection.executemany("DELETE FROM calculation_runs WHERE id = ?", [(item,) for item in stale_ids])
+        connection.commit()
+
+        record_row = one("""
+            SELECT id, calculated_at, start_date, end_date, strategy_version,
+                   strategy_json, stock_count, sector_count, created_at
+            FROM calculation_runs WHERE id = ?
+        """, (calculation_id,))
+        result = {
+            "ok": True,
+            "databaseFile": database_file,
+            "record": calculation_record(record_row),
+            "records": list_calculation_records(),
+            "top50TrackingId": str(tracking_id or ""),
+            "deletedCalculationIds": [str(item) for item in stale_ids]
+        }
+
+    elif operation == "read_calculation_result":
+        ensure_calculation_schema()
+        calculation_id = int(payload.get("calculationId") or 0)
+        if not calculation_id:
+            raise ValueError("未提供要读取的计算记录 ID")
+        run = one("""
+            SELECT id, calculated_at, start_date, end_date, strategy_version,
+                   strategy_json, market_json, bundle_meta_json,
+                   stock_count, sector_count, created_at
+            FROM calculation_runs WHERE id = ?
+        """, (calculation_id,))
+        if not run:
+            raise ValueError("所选计算记录不存在，可能已被最近五次保留规则清理")
+
+        stock_rows = connection.execute("""
+            SELECT result_json FROM calculation_stocks
+            WHERE calculation_id = ?
+            ORDER BY rank, stock_code
+        """, (calculation_id,)).fetchall()
+        sector_rows = connection.execute("""
+            SELECT result_json FROM calculation_sectors
+            WHERE calculation_id = ?
+            ORDER BY sort_order, sector_key
+        """, (calculation_id,)).fetchall()
+        stocks = [json_value(row["result_json"], {}) for row in stock_rows]
+        sectors = [json_value(row["result_json"], {}) for row in sector_rows]
+        bundle = json_value(run.get("bundle_meta_json"), {})
+        bundle.update({
+            "market": json_value(run.get("market_json"), {}),
+            "sectors": sectors,
+            "stocks": stocks,
+            "rawRows": [],
+            "calculationRange": {
+                "startDate": str(run.get("start_date") or ""),
+                "endDate": str(run.get("end_date") or "")
+            },
+            "databaseFile": database_file
+        })
+        result = {
+            "ok": True,
+            "databaseFile": database_file,
+            "record": calculation_record(run),
+            "strategy": json_value(run.get("strategy_json"), {}),
+            "bundle": bundle
+        }
+
+    elif operation == "delete_calculation_result":
+        ensure_calculation_schema()
+        calculation_id = int(payload.get("calculationId") or 0)
+        if not calculation_id:
+            raise ValueError("未提供要删除的计算记录 ID")
+        connection.execute("BEGIN IMMEDIATE")
+        run = one("SELECT id, calculated_at FROM calculation_runs WHERE id = ?", (calculation_id,))
+        if not run:
+            raise ValueError("所选计算记录不存在或已经被删除")
+        tracking_ids = [str(row["id"]) for row in connection.execute(
+            "SELECT id FROM top50_tracking_runs WHERE source_calculation_id = ?",
+            (calculation_id,)
+        ).fetchall()]
+        # Top50 跟踪与完整计算结果生命周期独立，所以显式删除关联跟踪批次；
+        # 逐股、板块和跟踪明细分别由外键级联清理。
+        connection.execute(
+            "DELETE FROM top50_tracking_runs WHERE source_calculation_id = ?",
+            (calculation_id,)
+        )
+        connection.execute("DELETE FROM calculation_runs WHERE id = ?", (calculation_id,))
+        connection.commit()
+        result = {
+            "ok": True,
+            "databaseFile": database_file,
+            "deletedCalculationId": str(calculation_id),
+            "deletedTrackingIds": tracking_ids,
+            "records": list_calculation_records()
+        }
+
+    elif operation == "refresh_top50_performance":
+        ensure_calculation_schema()
+        connection.execute("BEGIN IMMEDIATE")
+        tracking_id = int(payload.get("trackingId") or 0)
+        refresh_top50_tracking(
+            tracking_id if tracking_id else None,
+            bool(payload.get("force"))
+        )
+        deleted_ids = cleanup_top50_tracking_records()
+        connection.commit()
+        result = {
+            "ok": True,
+            "databaseFile": database_file,
+            "records": list_top50_tracking_records(),
+            "deletedTrackingIds": [str(item) for item in deleted_ids]
+        }
+
+    elif operation == "read_top50_performance":
+        ensure_calculation_schema()
+        tracking_id = int(payload.get("trackingId") or 0)
+        if not tracking_id:
+            raise ValueError("未提供要读取的 Top50 跟踪记录 ID")
+        connection.commit()
+        detail = top50_tracking_detail(tracking_id)
+        result = {
+            "ok": True,
+            "databaseFile": database_file,
+            **detail
+        }
+
+    elif operation == "inspect_coverage":
         connection.execute("PRAGMA query_only = ON")
         dataset = one("""
             SELECT id, start_date AS startDate, end_date AS endDate, source, adjust
@@ -3639,10 +4414,10 @@ async function runSqliteHistoryOperation(operation, payload = {}) {
         pythonPath,
         script: SQLITE_HISTORY_BRIDGE_SCRIPT,
         input,
-        timeout: 120000,
-        label: 'SQLite 历史数据操作'
+        timeout: operation === 'save_calculation_result' ? 180000 : 120000,
+        label: 'SQLite 数据库操作'
       })
-      if (!result?.ok) throw new Error(result?.error || 'SQLite 历史数据操作失败')
+      if (!result?.ok) throw new Error(result?.error || 'SQLite 数据库操作失败')
       return result
     } catch (error) {
       if (/无法启动 Python/i.test(String(error?.message || error))) {
@@ -3654,6 +4429,64 @@ async function runSqliteHistoryOperation(operation, payload = {}) {
   }
 
   throw new Error(`无法启动 Python sqlite3 运行环境：${lastStartError?.message || '未找到 python/py 命令'}`)
+}
+
+async function listCalculationResultsFromSqlite() {
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    return { ok: true, databaseFile: STOCK_REVIEW_DATABASE_FILE, records: [] }
+  }
+  return runSqliteHistoryOperation('list_calculation_results')
+}
+
+async function saveCalculationResultToSqlite(options = {}) {
+  if (isFullHistoryActive()) throw new Error('历史数据正在写入 SQLite，请等待获取完成后再计算')
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    throw new Error(`未找到 SQLite 数据库：${STOCK_REVIEW_DATABASE_FILE}`)
+  }
+  return runSqliteHistoryOperation('save_calculation_result', {
+    bundle: options.bundle || {},
+    strategy: options.strategy || {},
+    savedAt: options.savedAt || new Date().toISOString()
+  })
+}
+
+async function readCalculationResultFromSqlite(options = {}) {
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    throw new Error(`未找到 SQLite 数据库：${STOCK_REVIEW_DATABASE_FILE}`)
+  }
+  return runSqliteHistoryOperation('read_calculation_result', {
+    calculationId: String(options.calculationId || options.id || '')
+  })
+}
+
+async function deleteCalculationResultFromSqlite(options = {}) {
+  if (isFullHistoryActive()) throw new Error('历史数据正在写入 SQLite，请等待获取完成后再删除计算记录')
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    throw new Error(`未找到 SQLite 数据库：${STOCK_REVIEW_DATABASE_FILE}`)
+  }
+  return runSqliteHistoryOperation('delete_calculation_result', {
+    calculationId: String(options.calculationId || options.id || '')
+  })
+}
+
+async function refreshTop50PerformanceFromSqlite(options = {}) {
+  if (isFullHistoryActive()) throw new Error('历史数据正在写入 SQLite，请等待获取完成后再刷新 Top50 跟踪')
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    return { ok: true, databaseFile: STOCK_REVIEW_DATABASE_FILE, records: [] }
+  }
+  return runSqliteHistoryOperation('refresh_top50_performance', {
+    trackingId: String(options.trackingId || options.id || ''),
+    force: Boolean(options.force)
+  })
+}
+
+async function readTop50PerformanceFromSqlite(options = {}) {
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    throw new Error(`未找到 SQLite 数据库：${STOCK_REVIEW_DATABASE_FILE}`)
+  }
+  return runSqliteHistoryOperation('read_top50_performance', {
+    trackingId: String(options.trackingId || options.id || '')
+  })
 }
 
 async function inspectFullHistoryDateCoverage(startDate, endDate) {
@@ -3867,7 +4700,11 @@ function appendFullHistoryProcessOutput(job, key, chunk) {
 }
 
 function startFullHistoryExecutableProcess(job) {
-  const args = buildFullHistoryArgs(job.startDate, job.endDate)
+  const executionOptions = {
+    selectedOnly: Boolean(job.selectedOnly),
+    selectedCodesFile: job.selectedCodesFile || ''
+  }
+  const args = buildFullHistoryArgs(job.startDate, job.endDate, executionOptions)
   const child = spawn(FULL_HISTORY_EXECUTABLE, args, {
     cwd: FULL_HISTORY_DATA_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -3877,7 +4714,7 @@ function startFullHistoryExecutableProcess(job) {
   fullHistoryProcess = child
   job.status = 'running'
   job.processId = Number(child.pid) || null
-  job.command = buildFullHistoryCommand(job.startDate, job.endDate)
+  job.command = buildFullHistoryCommand(job.startDate, job.endDate, executionOptions)
   job.message = `历史数据程序已启动，进程 PID ${job.processId || '--'}`
   job.stdoutLineBuffer = ''
 
@@ -3953,14 +4790,18 @@ function startFullHistoryExecutableProcess(job) {
     job.status = 'completed'
     job.message = job.appendMode
       ? '历史数据程序执行完成，正在合并 SQLite 历史日期范围'
-      : '历史数据程序执行完成，数据已写入 SQLite'
+      : job.selectedOnly
+        ? `选中的 ${job.selectedCodes.length} 只股票历史数据获取完成，正在刷新 SQLite 状态`
+        : '历史数据程序执行完成，数据已写入 SQLite'
     reconcileAppend()
       .then(() => queryFullHistoryDatabaseStatus())
       .then(payload => {
         applyDatabaseStatusToJob(payload, job)
         job.message = job.appendMode
           ? `历史数据追加完成，SQLite 当前历史范围为 ${job.indexStartDate || '--'} 至 ${job.indexEndDate || '--'}`
-          : '历史数据程序执行完成，数据已写入 SQLite'
+          : job.selectedOnly
+            ? `选中的 ${job.selectedCodes.length} 只股票历史数据已写入 SQLite`
+            : '历史数据程序执行完成，数据已写入 SQLite'
       })
       .catch(queryError => addFullHistoryError(job, `读取数据库状态失败：${queryError.message || queryError}`))
   }
@@ -5096,11 +5937,71 @@ async function startFullMarketHistorySync(options = {}) {
 
   const startDate = normalizeFullHistoryDate(options.startDate)
   const endDate = normalizeFullHistoryDate(options.endDate)
+  const rawSelectedCodes = Array.isArray(options.selectedCodes) ? options.selectedCodes : []
+  const selectedCodes = Array.from(new Set(
+    rawSelectedCodes.map(normalizeCacheCode).filter(code => code && isFullHistoryAStock({ code }))
+  ))
   if (!startDate || !endDate) throw new Error('请先选择开始时间和结束时间')
   if (startDate > endDate) throw new Error('开始时间不能晚于结束时间')
+  if (rawSelectedCodes.length && !selectedCodes.length) throw new Error('所选证券中没有可获取历史数据的沪深北 A 股')
 
   if (!fs.existsSync(FULL_HISTORY_EXECUTABLE)) {
     throw new Error(`未找到历史数据程序，请将 ${FULL_HISTORY_EXECUTABLE_NAME} 放入：${FULL_HISTORY_DATA_DIR}`)
+  }
+
+  if (selectedCodes.length) {
+    const databaseStatus = await queryFullHistoryDatabaseStatus()
+    const allItems = databaseStatusItems(databaseStatus)
+    const itemsByCode = new Map(allItems.map(item => [item.code, item]))
+    const missingCodes = selectedCodes.filter(code => !itemsByCode.has(code))
+    if (missingCodes.length) {
+      throw new Error(`所选股票不在当前有效快照清单中：${missingCodes.slice(0, 5).join('、')}${missingCodes.length > 5 ? '…' : ''}`)
+    }
+    const selectedItems = selectedCodes.map(code => ({
+      ...itemsByCode.get(code),
+      status: 'pending',
+      message: '等待获取选中历史数据'
+    }))
+    ensureFullHistoryDir()
+    atomicWriteJson(FULL_HISTORY_SELECTED_CODES_FILE, {
+      schemaVersion: 1,
+      type: 'selected_history_codes',
+      generatedAt: new Date().toISOString(),
+      startDate,
+      endDate,
+      stocks: selectedItems.map(item => ({ code: item.code, name: item.name || item.code }))
+    })
+    const selectedExecutionOptions = {
+      selectedOnly: true,
+      selectedCodesFile: FULL_HISTORY_SELECTED_CODES_NAME
+    }
+    fullHistoryJob = createFullHistoryJob({
+      status: 'preparing',
+      startDate,
+      endDate,
+      startedAt: new Date().toISOString(),
+      databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      executable: FULL_HISTORY_EXECUTABLE,
+      command: buildFullHistoryCommand(startDate, endDate, selectedExecutionOptions),
+      indexStartDate: databaseStatus?.dataset?.start_date || '',
+      indexEndDate: databaseStatus?.dataset?.end_date || '',
+      indexedStockCount: selectedItems.filter(item => item.status !== 'pending').length,
+      missingStockCount: selectedItems.length,
+      selectedOnly: true,
+      selectedCodes,
+      selectedCodesFile: FULL_HISTORY_SELECTED_CODES_NAME,
+      message: `准备获取 ${selectedItems.length} 只选中 A 股在 ${startDate} 至 ${endDate} 的历史数据`
+    }, selectedItems)
+
+    try {
+      startFullHistoryExecutableProcess(fullHistoryJob)
+    } catch (error) {
+      fullHistoryJob.status = 'failed'
+      fullHistoryJob.finishedAt = new Date().toISOString()
+      fullHistoryJob.message = `无法启动选中股票历史数据程序：${error.message || error}`
+      fullHistoryJob.errors.push(fullHistoryJob.message)
+    }
+    return buildFullHistorySnapshot(fullHistoryJob)
   }
 
   const coverage = await inspectFullHistoryDateCoverage(startDate, endDate)
@@ -5379,6 +6280,24 @@ window.stockReviewBridge = {
   async readStockHistoryFromSqlite(options) {
     return readStockHistoryFromSqlite(options)
   },
+  async listCalculationResultsFromSqlite() {
+    return listCalculationResultsFromSqlite()
+  },
+  async saveCalculationResultToSqlite(options) {
+    return saveCalculationResultToSqlite(options)
+  },
+  async readCalculationResultFromSqlite(options) {
+    return readCalculationResultFromSqlite(options)
+  },
+  async deleteCalculationResultFromSqlite(options) {
+    return deleteCalculationResultFromSqlite(options)
+  },
+  async refreshTop50PerformanceFromSqlite(options) {
+    return refreshTop50PerformanceFromSqlite(options)
+  },
+  async readTop50PerformanceFromSqlite(options) {
+    return readTop50PerformanceFromSqlite(options)
+  },
   async prepareFullMarketHistoryList(options) {
     return prepareFullMarketHistoryList(options)
   },
@@ -5397,7 +6316,7 @@ window.stockReviewBridge = {
   async cleanupFullMarketHistoryExecutableData() {
     return cleanupFullMarketHistoryExecutableData()
   },
-  async getFullMarketHistorySyncStatus() {
+  async getFullMarketHistorySyncStatus(options = {}) {
     ensureFullHistoryDir()
     if (!isFullHistoryActive()) {
       try {
@@ -5410,6 +6329,7 @@ window.stockReviewBridge = {
             : 'SQLite 数据库中尚无股票快照'
         }
       } catch (error) {
+        if (options.throwOnDatabaseError) throw error
         if (!fullHistoryJob.items.length) {
           fullHistoryJob.message = error.message || '读取 SQLite 数据库状态失败'
         }

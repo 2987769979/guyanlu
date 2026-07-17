@@ -7,7 +7,7 @@ export const DEFAULT_DATA_CONFIG = {
   endDate: ''
 }
 
-const ONE_DAY = 24 * 60 * 60 * 1000
+const DEFAULT_WORKDAY_RANGE = 70
 
 // 本地样例数据保持和真实数据相同的数据结构，方便 UI 与策略逻辑统一处理。
 export function createSampleDataBundle() {
@@ -48,7 +48,18 @@ export function saveDataConfig(config) {
 
 export function getDefaultDateRange() {
   const end = new Date()
-  const start = new Date(end.getTime() - 30 * ONE_DAY)
+  end.setHours(12, 0, 0, 0)
+  while (end.getDay() === 0 || end.getDay() === 6) {
+    end.setDate(end.getDate() - 1)
+  }
+
+  const start = new Date(end)
+  let includedWorkdays = 1
+  while (includedWorkdays < DEFAULT_WORKDAY_RANGE) {
+    start.setDate(start.getDate() - 1)
+    if (start.getDay() !== 0 && start.getDay() !== 6) includedWorkdays += 1
+  }
+
   return {
     startDate: formatDate(start),
     endDate: formatDate(end)
