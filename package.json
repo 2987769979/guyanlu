@@ -2,7 +2,9 @@
   "private": true,
   "scripts": {
     "dev": "webpack -w --mode development",
-    "build": "webpack --mode production"
+    "build": "webpack --mode production",
+    "build:sqlite-bridge": "node tools/build-sqlite-bridge.js",
+    "build:release": "npm run build:sqlite-bridge && npm run build"
   },
   "dependencies": {
     "react": "^19.2.0",

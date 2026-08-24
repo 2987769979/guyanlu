@@ -2,6 +2,14 @@
 
 固定数据库文件：`%LOCALAPPDATA%\股研录\history-data\stock-review.db`
 
+插件内置 `sqlite_bridge.exe` 负责计算记录、Top50 跟踪和历史范围状态等 SQLite
+事务操作。运行时会从插件包自动释放到 `%LOCALAPPDATA%\股研录\runtime`，目标电脑
+无需安装 Python。发布前使用 `npm run build:release` 同时构建桥接程序和插件资源；
+桥接程序与 preload 内的 SQLite 逻辑带哈希校验，二者不一致时会拒绝执行并提示重新构建。
+开发机首次构建前需要执行 `python -m pip install pyinstaller`；这只是构建依赖，
+不会成为目标电脑的运行依赖。生成的发布资源位于 `public/runtime/sqlite_bridge.exe`，
+Webpack 会将其复制到 `dist/runtime/sqlite_bridge.exe`。
+
 数据库使用 WAL 日志、外键约束和 30 秒 busy timeout。快照与历史程序共用同一个数据库，不再生成 `all-market-stocks.json`、`all-market-stocks-Calculate.json`、`stock-history-index.json` 或单股 JSON。
 
 ## 表结构
@@ -20,6 +28,7 @@
 | `calculation_sectors` | 某次计算的板块强弱结果 | `(calculation_id, sector_key)` 联合主键；按展示顺序索引；批次删除时级联删除 |
 | `top50_tracking_runs` | 每次计算前 50 名的五日跟踪批次及汇总指标 | `source_calculation_id` 唯一；按信号日和状态索引；独立保留最近 250 个批次 |
 | `top50_tracking_items` | Top50 单股买卖价、收益率、股数和盈亏金额 | `(tracking_id, stock_code)` 联合主键；按排名和结果状态索引；批次删除时级联删除 |
+| `top50_tracking_deletions` | 用户主动删除的回测批次标记 | 记录来源计算批次，防止刷新时被自动补建；来源计算记录清理后同步移除标记 |
 
 `history_datasets` 被删除时，其运行记录、单股状态和日 K 数据通过外键级联清理；`stocks` 与 `snapshot_runs` 保留。
 
@@ -88,7 +97,8 @@ CREATE TABLE top50_tracking_runs (
     signal_date           TEXT NOT NULL,
     strategy_version      TEXT NOT NULL DEFAULT '',
     horizon_days          INTEGER NOT NULL DEFAULT 5,
-    capital_per_stock     REAL NOT NULL DEFAULT 10000,
+    capital_per_stock     REAL NOT NULL DEFAULT 10000, -- 旧预算口径兼容字段，不再参与股数计算
+    position_size_version INTEGER NOT NULL DEFAULT 2,
     cost_rate             REAL NOT NULL DEFAULT 0,
     entry_date             TEXT,
     exit_date              TEXT,
@@ -141,11 +151,13 @@ CREATE TABLE top50_tracking_items (
 - 信号日 `T` 使用计算批次中的市场交易日，买入价为 `T+1` 开盘价。未来行情达到 1～4 个完整市场交易日时，先使用当前最后一个未来交易日的收盘价生成阶段结果；达到第 5 日后使用 T+5 收盘价形成最终结果。
 - `history_dataset_id` 固定记录计算发生时使用的历史数据集；该数据集仍存在时优先从其中取未来行情，已被清理时才回退到当前活动数据集。
 - 完整市场交易日要求 `daily_bars` 至少包含 1000 个不同股票代码，避免单股补数据被误当成新交易日。
-- 单股预算默认 10000 元，买入股数为 `floor(10000 / T+1开盘价 / 100) * 100`；不足 100 股时记为不可交易。
+- 每只股票固定买入 1 手（100 股），不再根据股价或单股预算折算股数；`capital_per_stock` 仅保留用于兼容旧数据库。
 - 毛收益率为 `(卖出价 / 买入价 - 1) * 100`；净收益率再减去策略的综合成本率；胜率只统计可交易股票中净收益率大于 0 的比例。
 - 每股涨跌额合计为 50 只股票中可交易标的 `(卖出价 - 买入价)` 的总和；盈亏金额为 `股数 * (卖出价 - 买入价) - 实际投入金额 * 综合成本率 / 100`；组合收益率为总盈亏金额除以总实际投入金额。
 - 若股票在当前估值日停牌，使用 `T+1` 至当前估值日范围内最近一个有效收盘价，阶段明细标记为 `partial_estimated`，最终明细标记为 `completed_estimated`；若 `T+1` 无开盘价则不纳入胜率和金额汇总。
 - 每次打开“Top50 五日跟踪”页面、点击“刷新未来行情”以及每日快照成功入库后，程序都会重新扫描。没有未来行情时状态为 `pending`，存在 1～4 日时为 `partial`，达到 5 日时为 `completed`。
+- 旧版“每股 1 万元预算”批次通过 `position_size_version` 标记，首次刷新时自动按固定 100 股重算一次。
+- 用户可在回测批次下拉列表中删除单个跟踪批次；删除会级联清理 `top50_tracking_items` 明细，并写入 `top50_tracking_deletions` 防止刷新后自动补建，但不会删除来源计算结果或历史行情。
 
 ## 历史日期增量追加
 

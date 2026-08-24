@@ -5,6 +5,7 @@
  */
 const { clipboard } = require('electron')
 const { spawn } = require('child_process')
+const crypto = require('crypto')
 const fs = require('fs')
 const http = require('http')
 const https = require('https')
@@ -97,6 +98,8 @@ const STOCK_REVIEW_SYSTEM_DATA_DIR = process.env.LOCALAPPDATA
 const FULL_HISTORY_DATA_DIR = path.join(STOCK_REVIEW_SYSTEM_DATA_DIR, 'history-data')
 const STOCK_REVIEW_DATABASE_NAME = 'stock-review.db'
 const STOCK_REVIEW_DATABASE_FILE = path.join(FULL_HISTORY_DATA_DIR, STOCK_REVIEW_DATABASE_NAME)
+const STOCK_REVIEW_RUNTIME_DIR = path.join(STOCK_REVIEW_SYSTEM_DATA_DIR, 'runtime')
+const SQLITE_BRIDGE_PACKAGED_EXECUTABLE = path.join(__dirname, 'runtime', 'sqlite_bridge.exe')
 const FULL_HISTORY_DAILY_DATA_DIR = path.join(FULL_HISTORY_DATA_DIR, 'daily')
 const FULL_HISTORY_STOCK_LIST_NAME = 'all-market-stocks.json'
 const FULL_HISTORY_STOCK_LIST_FILE = path.join(FULL_HISTORY_DATA_DIR, FULL_HISTORY_STOCK_LIST_NAME)
@@ -3319,11 +3322,17 @@ function runExecutableJson(executable, args, options = {}) {
       reject(new Error(`未找到可执行程序：${executable}`))
       return
     }
+    const hasInput = Object.prototype.hasOwnProperty.call(options, 'input')
     const child = spawn(executable, args, {
       cwd: FULL_HISTORY_DATA_DIR,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [hasInput ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       windowsHide: true,
-      shell: false
+      shell: false,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: 'utf-8',
+        ...(options.env || {})
+      }
     })
     const stdout = []
     const stderr = []
@@ -3350,6 +3359,17 @@ function runExecutableJson(executable, args, options = {}) {
     child.stdout.on('data', chunk => stdout.push(chunk))
     child.stderr.on('data', chunk => stderr.push(chunk))
     child.on('error', error => finish(reject, new Error(`无法启动 ${path.basename(executable)}：${error.message}`)))
+    if (hasInput && child.stdin) {
+      child.stdin.on('error', error => {
+        if (error?.code !== 'EPIPE') {
+          finish(reject, new Error(`向 ${path.basename(executable)} 写入数据失败：${error.message}`))
+        }
+      })
+      const inputText = typeof options.input === 'string'
+        ? options.input
+        : JSON.stringify(options.input ?? {})
+      child.stdin.end(Buffer.from(inputText, 'utf8'))
+    }
     child.on('close', code => {
       const outText = Buffer.concat(stdout).toString('utf8').trim()
       const errText = Buffer.concat(stderr).toString('utf8').trim()
@@ -3535,6 +3555,7 @@ def ensure_calculation_schema():
             strategy_version TEXT NOT NULL DEFAULT '',
             horizon_days INTEGER NOT NULL DEFAULT 5 CHECK (horizon_days > 0),
             capital_per_stock REAL NOT NULL DEFAULT 10000 CHECK (capital_per_stock > 0),
+            position_size_version INTEGER NOT NULL DEFAULT 2 CHECK (position_size_version >= 0),
             cost_rate REAL NOT NULL DEFAULT 0 CHECK (cost_rate >= 0),
             entry_date TEXT,
             exit_date TEXT,
@@ -3561,6 +3582,11 @@ def ensure_calculation_schema():
 
         CREATE INDEX IF NOT EXISTS idx_top50_tracking_runs_status
         ON top50_tracking_runs(status, signal_date);
+
+        CREATE TABLE IF NOT EXISTS top50_tracking_deletions (
+            source_calculation_id INTEGER PRIMARY KEY,
+            deleted_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS top50_tracking_items (
             tracking_id INTEGER NOT NULL,
@@ -3601,6 +3627,9 @@ def ensure_calculation_schema():
         connection.execute("ALTER TABLE top50_tracking_runs ADD COLUMN history_dataset_id INTEGER")
     if "sum_price_change" not in tracking_columns:
         connection.execute("ALTER TABLE top50_tracking_runs ADD COLUMN sum_price_change REAL")
+    if "position_size_version" not in tracking_columns:
+        # 旧批次使用“每股 1 万元预算”口径，标记为 0，刷新时会按固定 100 股重算一次。
+        connection.execute("ALTER TABLE top50_tracking_runs ADD COLUMN position_size_version INTEGER NOT NULL DEFAULT 0")
 
 def calculation_record(row):
     strategy = json_value(row.get("strategy_json"), {})
@@ -3647,6 +3676,8 @@ def top50_tracking_record(row):
         "strategyVersion": str(row.get("strategy_version") or ""),
         "horizonDays": int(row.get("horizon_days") or 5),
         "capitalPerStock": number(row.get("capital_per_stock"), 10000),
+        "sharesPerStock": 100,
+        "positionSizeVersion": int(row.get("position_size_version") or 0),
         "costRate": number(row.get("cost_rate"), 0),
         "entryDate": str(row.get("entry_date") or ""),
         "exitDate": str(row.get("exit_date") or ""),
@@ -3689,6 +3720,12 @@ def cleanup_top50_tracking_records(limit=250):
     return stale_ids
 
 def create_top50_tracking_for_calculation(calculation_id):
+    deleted = one(
+        "SELECT source_calculation_id FROM top50_tracking_deletions WHERE source_calculation_id = ?",
+        (calculation_id,)
+    )
+    if deleted:
+        return None
     run = one("""
         SELECT id, calculated_at, end_date, strategy_version, strategy_json, market_json
         FROM calculation_runs WHERE id = ?
@@ -3706,9 +3743,9 @@ def create_top50_tracking_for_calculation(calculation_id):
     connection.execute("""
         INSERT OR IGNORE INTO top50_tracking_runs (
             source_calculation_id, history_dataset_id, calculated_at, signal_date, strategy_version,
-            horizon_days, capital_per_stock, cost_rate, status,
+            horizon_days, capital_per_stock, position_size_version, cost_rate, status,
             stock_count, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 5, 10000, ?, 'pending', 0, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, 5, 10000, 2, ?, 'pending', 0, ?, ?)
     """, (
         calculation_id,
         int(dataset["id"]) if dataset else None,
@@ -3758,11 +3795,16 @@ def create_top50_tracking_for_calculation(calculation_id):
     return tracking_id
 
 def backfill_top50_tracking():
+    connection.execute("""
+        DELETE FROM top50_tracking_deletions
+        WHERE source_calculation_id NOT IN (SELECT id FROM calculation_runs)
+    """)
     rows = connection.execute("""
         SELECT r.id
         FROM calculation_runs r
         LEFT JOIN top50_tracking_runs t ON t.source_calculation_id = r.id
-        WHERE t.id IS NULL
+        LEFT JOIN top50_tracking_deletions d ON d.source_calculation_id = r.id
+        WHERE t.id IS NULL AND d.source_calculation_id IS NULL
         ORDER BY r.calculated_at, r.id
     """).fetchall()
     for row in rows:
@@ -3783,7 +3825,8 @@ def future_market_dates(dataset_id, signal_date, horizon_days):
 
 def refresh_top50_tracking_run(tracking_id, dataset_id, force=False):
     run = one("SELECT * FROM top50_tracking_runs WHERE id = ?", (tracking_id,))
-    if not run or (run.get("status") == "completed" and not force):
+    position_size_version = int(run.get("position_size_version") or 0) if run else 0
+    if not run or (run.get("status") == "completed" and position_size_version >= 2 and not force):
         return
     stored_dataset_id = int(run.get("history_dataset_id") or 0)
     if stored_dataset_id:
@@ -3805,7 +3848,7 @@ def refresh_top50_tracking_run(tracking_id, dataset_id, force=False):
                 loss_count = 0, flat_count = 0, win_rate = NULL,
                 sum_price_change = NULL, sum_return_pct = NULL, avg_return_pct = NULL,
                 total_investment = NULL, total_profit = NULL, portfolio_return_pct = NULL,
-                updated_at = ?
+                position_size_version = 2, updated_at = ?
             WHERE id = ?
         """, (available_days, entry_date, now, tracking_id))
         connection.execute("""
@@ -3819,7 +3862,6 @@ def refresh_top50_tracking_run(tracking_id, dataset_id, force=False):
         """, (entry_date, now, tracking_id))
         return
 
-    capital_per_stock = number(run.get("capital_per_stock"), 10000)
     cost_rate = number(run.get("cost_rate"), 0.15)
     items = connection.execute("""
         SELECT stock_code FROM top50_tracking_items
@@ -3855,15 +3897,8 @@ def refresh_top50_tracking_run(tracking_id, dataset_id, force=False):
             ))
             continue
 
-        shares = int(capital_per_stock / entry_open / 100) * 100
-        if shares < 100:
-            results.append((
-                entry_date, exit_date, str(exit_row.get("trade_date") or ""), entry_open,
-                0, exit_close, None, exit_close - entry_open, None, None,
-                'insufficient_capital', now, tracking_id, code
-            ))
-            continue
-
+        # 回测仓位固定为每只股票 1 手（100 股），与股票价格无关。
+        shares = 100
         gross_return_pct = (exit_close / entry_open - 1) * 100
         net_return_pct = gross_return_pct - cost_rate
         investment_amount = shares * entry_open
@@ -3933,7 +3968,7 @@ def refresh_top50_tracking_run(tracking_id, dataset_id, force=False):
             tradable_count = ?, win_count = ?, loss_count = ?, flat_count = ?,
             win_rate = ?, sum_price_change = ?, sum_return_pct = ?, avg_return_pct = ?,
             total_investment = ?, total_profit = ?, portfolio_return_pct = ?,
-            updated_at = ?
+            position_size_version = 2, updated_at = ?
         WHERE id = ?
     """, (
         entry_date, exit_date, available_days, run_status, tradable_count, win_count,
@@ -3953,7 +3988,7 @@ def refresh_top50_tracking(tracking_id=None, force=False):
     else:
         query = "SELECT id FROM top50_tracking_runs"
         if not force:
-            query += " WHERE status <> 'completed'"
+            query += " WHERE status <> 'completed' OR position_size_version < 2"
         query += " ORDER BY signal_date, calculated_at, id"
         ids = [int(row["id"]) for row in connection.execute(query).fetchall()]
     for item in ids:
@@ -4185,6 +4220,10 @@ try:
             "DELETE FROM top50_tracking_runs WHERE source_calculation_id = ?",
             (calculation_id,)
         )
+        connection.execute(
+            "DELETE FROM top50_tracking_deletions WHERE source_calculation_id = ?",
+            (calculation_id,)
+        )
         connection.execute("DELETE FROM calculation_runs WHERE id = ?", (calculation_id,))
         connection.commit()
         result = {
@@ -4223,6 +4262,28 @@ try:
             "ok": True,
             "databaseFile": database_file,
             **detail
+        }
+
+    elif operation == "delete_top50_performance":
+        ensure_calculation_schema()
+        tracking_id = int(payload.get("trackingId") or 0)
+        if not tracking_id:
+            raise ValueError("未提供要删除的 Top50 跟踪记录 ID")
+        connection.execute("BEGIN IMMEDIATE")
+        run = one("SELECT id, source_calculation_id, signal_date, calculated_at FROM top50_tracking_runs WHERE id = ?", (tracking_id,))
+        if not run:
+            raise ValueError("所选 Top50 跟踪记录不存在或已经被删除")
+        connection.execute("""
+            INSERT OR REPLACE INTO top50_tracking_deletions (source_calculation_id, deleted_at)
+            VALUES (?, ?)
+        """, (int(run.get("source_calculation_id") or 0), utc_now()))
+        connection.execute("DELETE FROM top50_tracking_runs WHERE id = ?", (tracking_id,))
+        connection.commit()
+        result = {
+            "ok": True,
+            "databaseFile": database_file,
+            "deletedTrackingId": str(tracking_id),
+            "records": list_top50_tracking_records()
         }
 
     elif operation == "inspect_coverage":
@@ -4387,6 +4448,44 @@ finally:
 print(json.dumps(result, ensure_ascii=False))
 `
 
+const SQLITE_HISTORY_BRIDGE_HASH = crypto
+  .createHash('sha256')
+  .update(SQLITE_HISTORY_BRIDGE_SCRIPT.replace(/^\r?\n/, '').replace(/\r\n/g, '\n'), 'utf8')
+  .digest('hex')
+let sqliteBridgeExecutablePath = ''
+
+// uTools 会把插件资源打进 asar，Windows 不能直接从 asar 内启动 exe。
+// 首次使用时按内容哈希释放到 LOCALAPPDATA；版本化文件名也避免覆盖仍在运行的旧进程。
+function ensureSqliteBridgeExecutable() {
+  if (sqliteBridgeExecutablePath && fs.existsSync(sqliteBridgeExecutablePath)) {
+    return sqliteBridgeExecutablePath
+  }
+  if (!fs.existsSync(SQLITE_BRIDGE_PACKAGED_EXECUTABLE)) {
+    throw new Error('插件缺少 sqlite_bridge.exe，请执行 npm run build:release 后重新打包安装')
+  }
+
+  const executableBytes = fs.readFileSync(SQLITE_BRIDGE_PACKAGED_EXECUTABLE)
+  const executableHash = crypto.createHash('sha256').update(executableBytes).digest('hex').slice(0, 16)
+  const targetFile = path.join(STOCK_REVIEW_RUNTIME_DIR, `sqlite_bridge-${executableHash}.exe`)
+  fs.mkdirSync(STOCK_REVIEW_RUNTIME_DIR, { recursive: true })
+
+  if (!fs.existsSync(targetFile) || fs.statSync(targetFile).size !== executableBytes.length) {
+    const tempFile = `${targetFile}.${process.pid}.tmp`
+    fs.writeFileSync(tempFile, executableBytes)
+    try {
+      fs.renameSync(tempFile, targetFile)
+    } catch (error) {
+      try {
+        if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile)
+      } catch {}
+      if (!fs.existsSync(targetFile)) throw error
+    }
+  }
+
+  sqliteBridgeExecutablePath = targetFile
+  return targetFile
+}
+
 function formatSqliteHistoryBridgeError(error) {
   const message = String(error?.message || error || 'SQLite 操作失败').trim()
   if (/database is locked|database table is locked/i.test(message)) {
@@ -4399,36 +4498,19 @@ async function runSqliteHistoryOperation(operation, payload = {}) {
   const input = {
     ...payload,
     operation,
-    databaseFile: STOCK_REVIEW_DATABASE_FILE
+    databaseFile: STOCK_REVIEW_DATABASE_FILE,
+    __bridgeScriptHash: SQLITE_HISTORY_BRIDGE_HASH
   }
-  const candidates = Array.from(new Set([
-    String(process.env.PYTHON || '').trim(),
-    'python',
-    'py'
-  ].filter(Boolean)))
-  let lastStartError = null
-
-  for (const pythonPath of candidates) {
-    try {
-      const result = await runPythonJson({
-        pythonPath,
-        script: SQLITE_HISTORY_BRIDGE_SCRIPT,
-        input,
-        timeout: operation === 'save_calculation_result' ? 180000 : 120000,
-        label: 'SQLite 数据库操作'
-      })
-      if (!result?.ok) throw new Error(result?.error || 'SQLite 数据库操作失败')
-      return result
-    } catch (error) {
-      if (/无法启动 Python/i.test(String(error?.message || error))) {
-        lastStartError = error
-        continue
-      }
-      throw formatSqliteHistoryBridgeError(error)
-    }
+  try {
+    const result = await runExecutableJson(ensureSqliteBridgeExecutable(), [], {
+      input,
+      timeout: operation === 'save_calculation_result' ? 180000 : 120000
+    })
+    if (!result?.ok) throw new Error(result?.error || 'SQLite 数据库操作失败')
+    return result
+  } catch (error) {
+    throw formatSqliteHistoryBridgeError(error)
   }
-
-  throw new Error(`无法启动 Python sqlite3 运行环境：${lastStartError?.message || '未找到 python/py 命令'}`)
 }
 
 async function listCalculationResultsFromSqlite() {
@@ -4485,6 +4567,16 @@ async function readTop50PerformanceFromSqlite(options = {}) {
     throw new Error(`未找到 SQLite 数据库：${STOCK_REVIEW_DATABASE_FILE}`)
   }
   return runSqliteHistoryOperation('read_top50_performance', {
+    trackingId: String(options.trackingId || options.id || '')
+  })
+}
+
+async function deleteTop50PerformanceFromSqlite(options = {}) {
+  if (isFullHistoryActive()) throw new Error('历史数据正在写入 SQLite，请等待获取完成后再删除 Top50 跟踪记录')
+  if (!fs.existsSync(STOCK_REVIEW_DATABASE_FILE)) {
+    throw new Error(`未找到 SQLite 数据库：${STOCK_REVIEW_DATABASE_FILE}`)
+  }
+  return runSqliteHistoryOperation('delete_top50_performance', {
     trackingId: String(options.trackingId || options.id || '')
   })
 }
@@ -6298,6 +6390,9 @@ window.stockReviewBridge = {
   async readTop50PerformanceFromSqlite(options) {
     return readTop50PerformanceFromSqlite(options)
   },
+  async deleteTop50PerformanceFromSqlite(options) {
+    return deleteTop50PerformanceFromSqlite(options)
+  },
   async prepareFullMarketHistoryList(options) {
     return prepareFullMarketHistoryList(options)
   },
@@ -6342,11 +6437,15 @@ window.stockReviewBridge = {
     return {
       dataDir: FULL_HISTORY_DATA_DIR,
       databaseFile: STOCK_REVIEW_DATABASE_FILE,
+      databaseExists: fs.existsSync(STOCK_REVIEW_DATABASE_FILE),
       snapshotExecutable: FULL_HISTORY_SNAPSHOT_EXECUTABLE,
+      snapshotExecutableExists: fs.existsSync(FULL_HISTORY_SNAPSHOT_EXECUTABLE),
       snapshotCommand: `${path.basename(FULL_HISTORY_SNAPSHOT_EXECUTABLE)} --database "${STOCK_REVIEW_DATABASE_NAME}" --source baostock`,
       dailySnapshotExecutable: FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE,
+      dailySnapshotExecutableExists: fs.existsSync(FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE),
       dailySnapshotCommand: `${FULL_HISTORY_DAILY_SNAPSHOT_EXECUTABLE_NAME} --database "${STOCK_REVIEW_DATABASE_NAME}" --date <快照日期> --source auto`,
       historyExecutable: FULL_HISTORY_EXECUTABLE,
+      historyExecutableExists: fs.existsSync(FULL_HISTORY_EXECUTABLE),
       historyCommand: buildFullHistoryCommand('', ''),
       cleanupCommand: `${FULL_HISTORY_EXECUTABLE_NAME} --database "${STOCK_REVIEW_DATABASE_NAME}" --clear-history`
     }

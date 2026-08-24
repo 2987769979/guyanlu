@@ -9,7 +9,8 @@ export const STORAGE_KEYS = {
   reviewNotes: `${STORAGE_PREFIX}.review.notes`,
   watchlist: `${STORAGE_PREFIX}.review.watchlist`,
   portfolio: `${STORAGE_PREFIX}.portfolio.holdings`,
-  transactions: `${STORAGE_PREFIX}.portfolio.transactions`
+  transactions: `${STORAGE_PREFIX}.portfolio.transactions`,
+  tutorial: `${STORAGE_PREFIX}.settings.tutorial`
 }
 
 export const LEGACY_STORAGE_KEYS = {

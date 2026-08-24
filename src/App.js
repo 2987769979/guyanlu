@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createTheme, ThemeProvider } from '@mui/material/styles'
 import {
   Alert,
@@ -56,6 +56,7 @@ import SellOutlinedIcon from '@mui/icons-material/SellOutlined'
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined'
 import FileDownloadIcon from '@mui/icons-material/FileDownload'
 import FilterAltIcon from '@mui/icons-material/FilterAlt'
+import HelpOutlineIcon from '@mui/icons-material/HelpOutline'
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined'
 import NotesIcon from '@mui/icons-material/Notes'
 import PlayArrowIcon from '@mui/icons-material/PlayArrow'
@@ -98,6 +99,9 @@ import {
   removeStoredValue,
   writeStoredValue
 } from './storage'
+import TutorialOverlay from './tutorial/TutorialOverlay'
+import { createTutorialSteps, TUTORIAL_VERSION } from './tutorial/tutorialSteps'
+import useTutorial from './tutorial/useTutorial'
 
 const theme = createTheme({
   palette: {
@@ -688,6 +692,7 @@ export default function App() {
   const [historySyncAction, setHistorySyncAction] = useState(null)
   const [historyOverlapRequest, setHistoryOverlapRequest] = useState(null)
   const [top50Performance, setTop50Performance] = useState(EMPTY_TOP50_PERFORMANCE_STATE)
+  const [top50DeleteBusy, setTop50DeleteBusy] = useState(false)
   const top50PerformanceRequestRef = useRef(0)
   const [historySyncForm, setHistorySyncForm] = useState(() => ({
     startDate: initialAppState.dataConfig.startDate,
@@ -718,10 +723,92 @@ export default function App() {
   const [transactions, setTransactions] = useState(() => loadJsonArray(STORAGE_KEYS.transactions))
   const [positionPrefill, setPositionPrefill] = useState(null)
   const [statusInfo, setStatusInfo] = useState(() => createStatus('正在检查 SQLite 中的最近计算结果...'))
+  const [tutorialPreference, setTutorialPreference] = useState(() => {
+    const saved = readStoredValue(STORAGE_KEYS.tutorial, { completed: false, version: TUTORIAL_VERSION })
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) {
+      return { completed: Boolean(saved), version: TUTORIAL_VERSION }
+    }
+    return {
+      completed: Boolean(saved.completed),
+      version: Number(saved.version) || TUTORIAL_VERSION,
+      completedAt: saved.completedAt || '',
+      dismissedAt: saved.dismissedAt || ''
+    }
+  })
+  const tutorialAutoStartedRef = useRef(false)
   const status = statusInfo.message
   const updateStatus = (value, detail = '') => setStatusInfo(createStatus(value, detail))
   const setStatus = updateStatus
   const historySyncActive = HISTORY_SYNC_ACTIVE_STATUSES.has(historySync.status)
+
+  const tutorialPaths = useMemo(() => {
+    try {
+      return window.stockReviewBridge?.getFullMarketHistoryPaths?.() || {}
+    } catch {
+      return {}
+    }
+  }, [historySync.status, historySync.message])
+  const tutorialHistoryFiles = [
+    ['fetch_all_a_stocks_v2.exe', tutorialPaths.snapshotExecutableExists],
+    ['fetch_all_a_stocks_v3.exe', tutorialPaths.dailySnapshotExecutableExists],
+    ['fetch_a_stock_history_by_stock.exe', tutorialPaths.historyExecutableExists]
+  ]
+  const tutorialHistoryFileStatusKnown = tutorialHistoryFiles.every(([, exists]) => typeof exists === 'boolean')
+  const tutorialSteps = useMemo(() => createTutorialSteps({
+    historyDataDir: historySync.dataDir || tutorialPaths.dataDir || '',
+    historyFileStatusKnown: tutorialHistoryFileStatusKnown,
+    missingHistoryExecutables: tutorialHistoryFiles.filter(([, exists]) => exists === false).map(([name]) => name),
+    historyItemCount: Array.isArray(historySync.items) ? historySync.items.length : 0,
+    calculationCount: calculationHistory.length,
+    portfolioCount: portfolio.length,
+    backtestCount: top50Performance.records.length
+  }), [
+    historySync.dataDir,
+    historySync.items,
+    tutorialPaths.dataDir,
+    tutorialPaths.snapshotExecutableExists,
+    tutorialPaths.dailySnapshotExecutableExists,
+    tutorialPaths.historyExecutableExists,
+    tutorialHistoryFileStatusKnown,
+    calculationHistory.length,
+    portfolio.length,
+    top50Performance.records.length
+  ])
+
+  const persistTutorialCompletion = useCallback(reason => {
+    const completedAt = new Date().toISOString()
+    const nextPreference = {
+      completed: true,
+      version: TUTORIAL_VERSION,
+      completedAt: reason === 'completed' ? completedAt : '',
+      dismissedAt: reason === 'dismissed' ? completedAt : ''
+    }
+    writeStoredValue(STORAGE_KEYS.tutorial, nextPreference)
+    setTutorialPreference(nextPreference)
+  }, [])
+  const handleTutorialFinish = useCallback(
+    () => persistTutorialCompletion('completed'),
+    [persistTutorialCompletion]
+  )
+  const handleTutorialDismiss = useCallback(
+    () => persistTutorialCompletion('dismissed'),
+    [persistTutorialCompletion]
+  )
+
+  const tutorial = useTutorial({
+    steps: tutorialSteps,
+    activePage,
+    onPageChange: setActivePage,
+    onFinish: handleTutorialFinish,
+    onDismiss: handleTutorialDismiss
+  })
+
+  useEffect(() => {
+    if (tutorialPreference.completed || tutorial.open || tutorialAutoStartedRef.current) return undefined
+    tutorialAutoStartedRef.current = true
+    const timer = window.setTimeout(() => tutorial.start('auto'), 650)
+    return () => window.clearTimeout(timer)
+  }, [tutorialPreference.completed, tutorial.open, tutorial.start])
 
   const activeMarket = dataBundle.market
   const activeSectors = dataBundle.sectors
@@ -1155,6 +1242,52 @@ export default function App() {
     } catch (error) {
       if (requestId !== top50PerformanceRequestRef.current) return
       setTop50Performance(current => ({ ...current, loading: false, error: error.message || '读取 Top50 跟踪详情失败' }))
+    }
+  }
+
+  async function handleDeleteTop50Performance(record) {
+    const trackingId = String(record?.id || '')
+    const bridge = window.stockReviewBridge
+    if (!trackingId || !bridge?.deleteTop50PerformanceFromSqlite) {
+      setStatus('当前环境不支持删除 Top50 跟踪记录')
+      return false
+    }
+
+    const requestId = ++top50PerformanceRequestRef.current
+    setTop50DeleteBusy(true)
+    setTop50Performance(current => ({ ...current, loading: true, error: '' }))
+    try {
+      const response = await bridge.deleteTop50PerformanceFromSqlite({ trackingId })
+      const records = Array.isArray(response?.records) ? response.records : []
+      const previousSelectedId = String(top50Performance.selectedId || '')
+      const selectedId = previousSelectedId !== trackingId && records.some(item => String(item.id) === previousSelectedId)
+        ? previousSelectedId
+        : String(records[0]?.id || '')
+      let detail = null
+      let detailError = ''
+      if (selectedId && bridge.readTop50PerformanceFromSqlite) {
+        try {
+          detail = await bridge.readTop50PerformanceFromSqlite({ trackingId: selectedId })
+        } catch (error) {
+          detailError = error.message || '读取下一条 Top50 跟踪记录失败'
+        }
+      }
+      if (requestId !== top50PerformanceRequestRef.current) return true
+      setTop50Performance({ loading: false, records, selectedId, detail, error: detailError })
+      setStatus(
+        `已删除 ${record.signalDate || formatDateTime(record.calculatedAt)} 的 Top50 跟踪记录`,
+        `回测批次 ${trackingId} 及其逐股明细已删除；来源计算结果和历史行情未受影响。`
+      )
+      return true
+    } catch (error) {
+      if (requestId === top50PerformanceRequestRef.current) {
+        const message = error.message || '删除 Top50 跟踪记录失败'
+        setTop50Performance(current => ({ ...current, loading: false, error: message }))
+        setStatus(message, errorDetail(error, '删除 Top50 跟踪记录失败'))
+      }
+      return false
+    } finally {
+      setTop50DeleteBusy(false)
     }
   }
 
@@ -1932,6 +2065,7 @@ export default function App() {
               <Tab
                 key={item.id}
                 value={item.id}
+                data-tour-id={`nav-${item.id}`}
                 icon={item.icon}
                 iconPosition='start'
                 label={item.label}
@@ -1953,6 +2087,8 @@ export default function App() {
             onRefresh={() => handleRefreshData()}
             onCopyReview={handleCopyReview}
             onCopyStatus={handleCopyStatus}
+            onOpenTutorial={() => tutorial.start('manual')}
+            compact={compact}
             market={activeMarket}
             query={query}
             onQueryChange={setQuery}
@@ -2077,11 +2213,13 @@ export default function App() {
           {activePage === 'backtest' && (
             <BacktestPage
               performance={top50Performance}
+              deleteBusy={top50DeleteBusy}
               onRefresh={() => refreshTop50Performance(top50Performance.selectedId, {
                 force: true,
                 refreshSelectedOnly: Boolean(top50Performance.selectedId)
               })}
               onSelectRun={handleSelectTop50Performance}
+              onDeleteRun={handleDeleteTop50Performance}
             />
           )}
           {activePage === 'risk' && (
@@ -2107,12 +2245,22 @@ export default function App() {
             }}
           />
         )}
+        <TutorialOverlay
+          open={tutorial.open}
+          step={tutorial.step}
+          index={tutorial.index}
+          total={tutorial.total}
+          onPrevious={tutorial.previous}
+          onNext={tutorial.next}
+          onPause={tutorial.pause}
+          onDismiss={tutorial.dismiss}
+        />
       </Box>
     </ThemeProvider>
   )
 }
 
-function HeaderBar({ status, statusDetail, isRefreshing, onRefresh, onCopyReview, onCopyStatus, market, query, onQueryChange }) {
+function HeaderBar({ status, statusDetail, isRefreshing, onRefresh, onCopyReview, onCopyStatus, onOpenTutorial, compact, market, query, onQueryChange }) {
   return (
     <Paper className='topbar' elevation={0}>
       <Box>
@@ -2122,6 +2270,17 @@ function HeaderBar({ status, statusDetail, isRefreshing, onRefresh, onCopyReview
         </Typography>
       </Box>
       <Box className='topbar-actions'>
+        <Tooltip title='打开功能教程'>
+          {compact ? (
+            <IconButton data-tour-id='tutorial-button' color='primary' onClick={onOpenTutorial} aria-label='打开功能教程'>
+              <HelpOutlineIcon />
+            </IconButton>
+          ) : (
+            <Button data-tour-id='tutorial-button' variant='outlined' size='small' startIcon={<HelpOutlineIcon />} onClick={onOpenTutorial}>
+              教程
+            </Button>
+          )}
+        </Tooltip>
         <TextField
           size='small'
           value={query}
@@ -2188,7 +2347,7 @@ function ReviewPage({ market, sectors, scoredStocks, pools, review, onOpenPools,
         )}
       />
 
-      <Box className='metric-grid'>
+      <Box className='metric-grid' data-tour-id='review-overview'>
         <MetricCard label='市场情绪' value={`${market.marketScore}`} sub={market.marketState} accent='blue' />
         <MetricCard label='全市场成交额' value={`${market.totalAmount}亿`} sub={`较前日 ${formatPercent(market.amountChange)}`} accent='green' />
         <MetricCard label='上涨 / 下跌' value={`${market.advancers} / ${market.decliners}`} sub='涨跌家数' accent='cyan' />
@@ -2298,6 +2457,7 @@ function PoolsPage({
 
       <Paper className='panel' variant='outlined'>
         <Tabs
+          data-tour-id='pool-results'
           value={selectedPool}
           onChange={(_, value) => setSelectedPool(value)}
           variant='scrollable'
@@ -2617,7 +2777,7 @@ function StrategyPage({
         )}
       />
 
-      <Paper className='panel' variant='outlined'>
+      <Paper className='panel' variant='outlined' data-tour-id='calculation-source'>
         <Box className='panel-head'>
           <Box>
             <Typography variant='subtitle2' fontWeight={800}>页面显示数据源</Typography>
@@ -2752,7 +2912,7 @@ function StrategyPage({
         </DialogActions>
       </Dialog>
 
-      <Paper className='panel' variant='outlined'>
+      <Paper className='panel' variant='outlined' data-tour-id='calculation-run-panel'>
         <Box className='panel-head'>
           <Box>
             <Typography variant='subtitle2' fontWeight={800}>SQLite 计算范围</Typography>
@@ -2781,7 +2941,7 @@ function StrategyPage({
           />
         </Box>
         <Stack direction='row' spacing={1} mt={2} flexWrap='wrap' useFlexGap>
-          <Button startIcon={<SyncIcon />} variant='contained' onClick={onRefreshData} disabled={isRefreshing}>
+          <Button data-tour-id='calculate-from-sqlite' startIcon={<SyncIcon />} variant='contained' onClick={onRefreshData} disabled={isRefreshing}>
             {isRefreshing ? '计算中' : '从 SQLite 计算'}
           </Button>
           <Alert severity='info' sx={{ py: 0, alignItems: 'center' }}>
@@ -3043,6 +3203,7 @@ function HistorySyncPage({
               从文件刷新列表
             </Button>
             <Button
+              data-tour-id='history-refresh-snapshot'
               startIcon={isSnapshotRefreshing ? <SyncIcon className='spin-icon' /> : <TableChartIcon />}
               variant='outlined'
               onClick={onRefreshStockList}
@@ -3059,7 +3220,7 @@ function HistorySyncPage({
             >
               {isDailySnapshotFetching ? `获取中 ${formatElapsed(actionElapsedMs)}` : '获取每日快照'}
             </Button>
-            <Button startIcon={<PlayArrowIcon />} variant='contained' onClick={() => onStart()} disabled={isBusy || isActive}>
+            <Button data-tour-id='history-start' startIcon={<PlayArrowIcon />} variant='contained' onClick={() => onStart()} disabled={isBusy || isActive}>
               开始获取
             </Button>
             <Button
@@ -3113,7 +3274,7 @@ function HistorySyncPage({
             helperText='默认当天，也可指定历史日期'
           />
         </Box>
-        <Box className='history-details-head'>
+        <Box className='history-details-head' data-tour-id='history-prerequisites'>
           <Typography variant='subtitle2' fontWeight={800}>任务状态与文件位置</Typography>
           <Button
             size='small'
@@ -3466,7 +3627,9 @@ function Top50ItemStatusChip({ status }) {
   return <Chip size='small' label={meta.label} color={meta.color} variant='outlined' />
 }
 
-function BacktestPage({ performance, onRefresh, onSelectRun }) {
+function BacktestPage({ performance, deleteBusy, onRefresh, onSelectRun, onDeleteRun }) {
+  const [runMenuOpen, setRunMenuOpen] = useState(false)
+  const [deleteRecord, setDeleteRecord] = useState(null)
   const { loading, records, selectedId, detail, error } = performance
   const record = detail?.record || records.find(item => String(item.id) === String(selectedId)) || null
   const items = Array.isArray(detail?.items) ? detail.items : []
@@ -3475,6 +3638,15 @@ function BacktestPage({ performance, onRefresh, onSelectRun }) {
   const statusMeta = top50RunStatusMeta(record?.status, availableDays, horizonDays)
   const hasCompleted = record?.status === 'completed'
   const hasResults = hasCompleted || record?.status === 'partial'
+  const runLabel = item => {
+    const meta = top50RunStatusMeta(item?.status, item?.availableDays, item?.horizonDays)
+    return `${item?.signalDate || '--'} · ${formatDateTime(item?.calculatedAt)} · ${meta.label}`
+  }
+  const handleConfirmDelete = async () => {
+    if (!deleteRecord) return
+    const deleted = await onDeleteRun(deleteRecord)
+    if (deleted) setDeleteRecord(null)
+  }
 
   return (
     <Box className='page'>
@@ -3490,7 +3662,7 @@ function BacktestPage({ performance, onRefresh, onSelectRun }) {
       {loading && <LinearProgress sx={{ mb: 2 }} />}
       {error && <Alert severity='error' sx={{ mb: 2 }}>{error}</Alert>}
 
-      <Paper className='panel' variant='outlined' sx={{ mb: 2 }}>
+      <Paper className='panel' variant='outlined' sx={{ mb: 2 }} data-tour-id='backtest-summary'>
         <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ md: 'center' }} justifyContent='space-between'>
           <FormControl size='small' sx={{ minWidth: { xs: '100%', md: 360 } }}>
             <InputLabel id='top50-performance-label'>每日计算批次</InputLabel>
@@ -3498,17 +3670,44 @@ function BacktestPage({ performance, onRefresh, onSelectRun }) {
               labelId='top50-performance-label'
               value={selectedId || ''}
               label='每日计算批次'
+              open={runMenuOpen}
+              onOpen={() => setRunMenuOpen(true)}
+              onClose={() => setRunMenuOpen(false)}
               disabled={loading || records.length === 0}
               onChange={event => onSelectRun(event.target.value)}
+              renderValue={value => {
+                const selected = records.find(item => String(item.id) === String(value))
+                return selected ? runLabel(selected) : '所选 Top50 跟踪记录不存在'
+              }}
             >
-              {records.map(item => {
-                const meta = top50RunStatusMeta(item.status, item.availableDays, item.horizonDays)
-                return (
-                  <MenuItem key={item.id} value={String(item.id)}>
-                    {item.signalDate || '--'} · {formatDateTime(item.calculatedAt)} · {meta.label}
-                  </MenuItem>
-                )
-              })}
+              {records.map(item => (
+                <MenuItem key={item.id} value={String(item.id)} sx={{ gap: 1, pr: 0.5 }}>
+                  <Box component='span' sx={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {runLabel(item)}
+                  </Box>
+                  <Tooltip title='删除这条 Top50 跟踪记录'>
+                    <IconButton
+                      component='span'
+                      size='small'
+                      color='error'
+                      aria-label={`删除 ${item.signalDate || formatDateTime(item.calculatedAt)} 回测批次`}
+                      disabled={deleteBusy}
+                      onMouseDown={event => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                      }}
+                      onClick={event => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        setRunMenuOpen(false)
+                        setDeleteRecord(item)
+                      }}
+                    >
+                      <DeleteOutlineIcon fontSize='small' />
+                    </IconButton>
+                  </Tooltip>
+                </MenuItem>
+              ))}
             </Select>
           </FormControl>
           {record && (
@@ -3520,7 +3719,7 @@ function BacktestPage({ performance, onRefresh, onSelectRun }) {
           )}
         </Stack>
         <Alert severity='info' sx={{ mt: 2 }}>
-          统计口径：T 日计算排名前 50，T+1 开盘买入；有几个未来完整市场交易日就先计算到当前最后一日，满 5 日后形成最终结果。每股默认分配 1 万元、按 100 股整手交易，并扣除 {formatPercent(Number(record?.costRate) || 0.15)} 综合成本。停牌时使用当前估值日及之前最近一个有效收盘价。
+          统计口径：T 日计算排名前 50，T+1 开盘每只股票固定买入 1 手（100 股），不再按股票价格折算股数；有几个未来完整市场交易日就先计算到当前最后一日，满 5 日后形成最终结果，并扣除 {formatPercent(Number(record?.costRate) || 0.15)} 综合成本。停牌时使用当前估值日及之前最近一个有效收盘价。
         </Alert>
       </Paper>
 
@@ -3560,7 +3759,7 @@ function BacktestPage({ performance, onRefresh, onSelectRun }) {
             <MetricCard
               label='涨跌总金额'
               value={hasResults ? `¥${signed(record.totalProfit || 0)}` : '--'}
-              sub={hasResults ? `实际投入 ¥${formatCny(record.totalInvestment || 0)}` : '按每股 1 万元预算'}
+              sub={hasResults ? `实际投入 ¥${formatCny(record.totalInvestment || 0)}` : '固定每只股票 100 股'}
               accent='cyan'
             />
             <MetricCard
@@ -3633,6 +3832,32 @@ function BacktestPage({ performance, onRefresh, onSelectRun }) {
           </Paper>
         </>
       )}
+
+      <Dialog
+        open={Boolean(deleteRecord)}
+        onClose={() => { if (!deleteBusy) setDeleteRecord(null) }}
+        maxWidth='sm'
+        fullWidth
+      >
+        <DialogTitle>删除 Top50 回测记录</DialogTitle>
+        <DialogContent>
+          <Alert severity='warning' sx={{ mb: 2 }}>
+            此操作会永久删除该回测批次及其逐股明细，无法撤销。
+          </Alert>
+          <Typography variant='body2'>
+            {deleteRecord ? runLabel(deleteRecord) : ''}
+          </Typography>
+          <Typography variant='body2' color='text.secondary' sx={{ mt: 1 }}>
+            来源计算结果和历史行情数据不会被删除。
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteRecord(null)} disabled={deleteBusy}>取消</Button>
+          <Button color='error' variant='contained' onClick={handleConfirmDelete} disabled={deleteBusy}>
+            {deleteBusy ? '正在删除...' : '确认删除'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   )
 }
@@ -3731,7 +3956,7 @@ function StockTable({ rows, selectedStockCode, onSelectStock, onQuickAdd, compac
           </TableRow>
         </TableHead>
         <TableBody>
-          {sortedRows.map(row => (
+          {sortedRows.map((row, rowIndex) => (
             <TableRow key={row.code} hover selected={row.code === selectedStockCode} onClick={() => onSelectStock?.(row.code)} className='clickable-row'>
               <TableCell>{row.rank}</TableCell>
               <TableCell>
@@ -3749,6 +3974,7 @@ function StockTable({ rows, selectedStockCode, onSelectStock, onQuickAdd, compac
                 {onQuickAdd ? (
                   <Tooltip title='点击加入模拟持仓'>
                     <Typography
+                      data-tour-id={rowIndex === 0 ? 'quick-add-position' : undefined}
                       variant='body2'
                       component='span'
                       className='copy-cell'
@@ -3998,7 +4224,7 @@ function PortfolioPage({ portfolio, stocks, portfolioQuotes = {}, portfolioQuote
             <Button variant='outlined' startIcon={<ReceiptLongIcon />} onClick={() => setHistoryOpen(true)}>
               查看记录{transactions?.length ? ` (${transactions.length})` : ''}
             </Button>
-            <Button variant='contained' startIcon={<AddCircleOutlineIcon />} onClick={openAdd}>
+            <Button data-tour-id='add-position' variant='contained' startIcon={<AddCircleOutlineIcon />} onClick={openAdd}>
               添加持仓
             </Button>
           </Stack>
